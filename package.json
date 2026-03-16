@@ -1,0 +1,15 @@
+{
+  "name": "bsc-scanner",
+  "version": "1.0.0",
+  "description": "BSC new contract scanner with Telegram alerts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.0",
+    "axios": "^1.7.0"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+.env
+tmp_slither/
+tmp_mythril/
+tmp/
+tmp_test/
+tmp_test2/
+scanner.log
+checked_addresses.json

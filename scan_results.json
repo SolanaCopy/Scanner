@@ -1,0 +1,154 @@
+[
+  {
+    "address": "0x8599068597fd27D87514CB90c42300c03a474084",
+    "contractName": "ERC1967Proxy",
+    "balanceUsd": 246022,
+    "time": "2026-03-16T19:48:29.179Z",
+    "totalHigh": 1,
+    "totalMedium": 3,
+    "slither": {
+      "success": true,
+      "high": 0,
+      "medium": 2,
+      "findings": [
+        {
+          "check": "unused-return",
+          "impact": "Medium",
+          "description": "ERC1967Utils.upgradeToAndCall(address,bytes) (tmp_slither/0x8599068597fd27D87514CB90c42300c03a474084/ERC1967Proxy.sol#404-413) ignores return value by Address.functionDelegateCall(newImplementation,data) (tmp_slither/0x8599068597fd27D87514CB90c42300c03a474084/ERC1967Proxy.sol#409)\n"
+        },
+        {
+          "check": "unused-return",
+          "impact": "Medium",
+          "description": "ERC1967Utils.upgradeBeaconToAndCall(address,bytes) (tmp_slither/0x8599068597fd27D87514CB90c42300c03a474084/ERC1967Proxy.sol#494-503) ignores return value by Address.functionDelegateCall(IBeacon(newBeacon).implementation(),data) (tmp_slither/0x8599068597fd27D87514CB90c42300c03a474084/ERC1967Proxy.sol"
+        }
+      ]
+    },
+    "mythril": {
+      "success": true,
+      "high": 1,
+      "medium": 0,
+      "issues": [
+        {
+          "title": "Delegatecall to user-supplied address",
+          "severity": "High",
+          "swcId": "112",
+          "function": "fallback"
+        }
+      ]
+    },
+    "security": {
+      "success": true,
+      "findings": [
+        {
+          "category": "RUGPULL",
+          "severity": "MEDIUM",
+          "title": "Upgradeable",
+          "detail": "Logica kan vervangen worden"
+        }
+      ]
+    }
+  },
+  {
+    "address": "0x99F008922815f3C32ee33E894478931e2B43F655",
+    "contractName": "ERC1967Proxy",
+    "balanceUsd": 13410,
+    "time": "2026-03-16T19:55:48.273Z",
+    "totalHigh": 0,
+    "totalMedium": 1,
+    "slither": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "findings": []
+    },
+    "mythril": {
+      "success": true,
+      "high": 0,
+      "medium": 1,
+      "issues": [
+        {
+          "title": "Exception State",
+          "severity": "Medium",
+          "swcId": "110",
+          "function": "fallback"
+        }
+      ]
+    },
+    "security": {
+      "success": false,
+      "findings": []
+    }
+  },
+  {
+    "address": "0xB685760EBD368a891F27ae547391F4E2A289895b",
+    "contractName": "Bridgers",
+    "balanceUsd": 122387,
+    "time": "2026-03-16T19:42:45.922Z",
+    "totalHigh": 0,
+    "totalMedium": 0,
+    "slither": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "findings": []
+    },
+    "mythril": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "issues": []
+    },
+    "security": {
+      "success": false,
+      "findings": []
+    }
+  },
+  {
+    "address": "0xc55B409014480C4580A7Df71f4BB08CE20fb8935",
+    "contractName": "AToken",
+    "balanceUsd": 4701,
+    "time": "2026-03-16T19:48:04.497Z",
+    "totalHigh": 0,
+    "totalMedium": 0,
+    "slither": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "findings": []
+    },
+    "mythril": {
+      "success": false,
+      "high": 0,
+      "medium": 0,
+      "issues": []
+    },
+    "security": {
+      "success": false,
+      "findings": []
+    }
+  },
+  {
+    "address": "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789",
+    "contractName": "EntryPoint",
+    "balanceUsd": 61929,
+    "time": "2026-03-16T19:53:11.115Z",
+    "totalHigh": 0,
+    "totalMedium": 0,
+    "slither": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "findings": []
+    },
+    "mythril": {
+      "success": true,
+      "high": 0,
+      "medium": 0,
+      "issues": []
+    },
+    "security": {
+      "success": false,
+      "findings": []
+    }
+  }
+]
