@@ -18,6 +18,25 @@ const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const MIN_BALANCE_USD = parseFloat(process.env.MIN_BALANCE_USD) || 10000;
 const BSC_RPC = process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org';
 const STATUS_INTERVAL = 5 * 60 * 1000; // 5 minuten
+const RENDER_URL = process.env.RENDER_URL || '';
+const SCANNER_API_KEY = process.env.SCANNER_API_KEY || '';
+
+// === HEARTBEAT ===
+async function sendHeartbeat() {
+  if (!RENDER_URL) return;
+  try {
+    await axios.post(`${RENDER_URL}/api/scanner/heartbeat`, {
+      blocks: blocksScanned,
+      contracts: contractsFound,
+      balance10k: contractsWithBalance,
+      alerts: alertsSent,
+      liveBlocks: liveBlocksScanned,
+      workers: activeWorkers.size
+    }, { headers: { 'X-API-Key': SCANNER_API_KEY }, timeout: 5000 });
+  } catch (e) {
+    // stil falen
+  }
+}
 
 // === STABLECOIN ADRESSEN (BSC) ===
 const STABLECOINS = [
@@ -1811,6 +1830,8 @@ async function main() {
 
   setInterval(updateBnbPrice, 5 * 60 * 1000);
   setInterval(sendLiveUpdate, STATUS_INTERVAL);
+  setInterval(sendHeartbeat, 60000); // heartbeat elke minuut
+  sendHeartbeat(); // direct eerste heartbeat
 
   const currentBlock = await provider.getBlockNumber();
   currentBlockNum = currentBlock;
