@@ -129,6 +129,8 @@ let currentBlockNum = 0;
 let historyScanActive = false;
 let historyScanProgress = '';
 let liveBlocksScanned = 0;
+let consecutiveErrors = 0;
+let backwardDone = false;
 
 // Worker tracking (max 2 gelijktijdig)
 const MAX_WORKERS = 2;
@@ -1793,7 +1795,15 @@ async function scanBlock(blockNumber) {
     }
   } catch (err) {
     console.error(`[SCAN] Fout bij block ${blockNumber}:`, err.message);
+    consecutiveErrors++;
+    if (consecutiveErrors >= 10) {
+      const wait = Math.min(consecutiveErrors * 2, 60);
+      console.log(`[SCAN] ${consecutiveErrors} errors op rij, wacht ${wait}s...`);
+      await sleep(wait * 1000);
+    }
+    return;
   }
+  consecutiveErrors = 0;
 }
 
 // === LIVE UPDATE (elke 5 min) ===
@@ -1864,8 +1874,9 @@ async function main() {
   let scanBlock_num;
   const savedState = loadState();
 
-  if (savedState && savedState.scanBlock) {
-    scanBlock_num = savedState.scanBlock - 1; // -1 want hij scant backwards
+  const maxBackBlock = currentBlock - (7 * blocksPerDay); // max 7 dagen terug
+  if (savedState && savedState.scanBlock && savedState.scanBlock > maxBackBlock) {
+    scanBlock_num = savedState.scanBlock - 1;
     blocksScanned = savedState.blocksScanned || 0;
     contractsFound = savedState.contractsFound || 0;
     contractsWithBalance = savedState.contractsWithBalance || 0;
@@ -1879,8 +1890,10 @@ async function main() {
 
     await bot.sendMessage(CHAT_ID, `🔄 *Scanner Hervat!*\n\n⏪ Verder vanaf ~*${daysBack} dagen* terug\n📦 Al gescand: *${blocksScanned.toLocaleString()}* blocks\n📋 Contracten: *${contractsFound}* | Alerts: *${alertsSent}*`, { parse_mode: 'Markdown' });
   } else {
+    // State te oud of niet aanwezig — begin opnieuw vanaf 24u terug
     scanBlock_num = currentBlock - blocksPerDay;
-    console.log(`[START] Begin met terugkijken vanaf 24u geleden...`);
+    checkedAddresses.clear();
+    console.log(`[START] Begin vers vanaf 24u geleden (state te oud of niet aanwezig)`);
   }
 
   // === LIVE BLOCK MONITORING (vooruit) ===
@@ -1912,8 +1925,9 @@ async function main() {
     }
 
     try {
-      // Scan 1 block verder terug
-      if (scanBlock_num > 0) {
+      // Scan 1 block verder terug (max 7 dagen)
+      const maxBackBlock = currentBlock - (7 * 28800); // 7 dagen × 28800 blocks/dag
+      if (scanBlock_num > maxBackBlock) {
         await scanBlock(scanBlock_num);
         blocksScanned++;
         scanBlock_num--;
@@ -1929,9 +1943,13 @@ async function main() {
 
         await sleep(200);
       } else {
-        // Alles gescand tot block 0
-        await bot.sendMessage(CHAT_ID, `✅ *Volledige BSC blockchain gescand!*`, { parse_mode: 'Markdown' });
-        break;
+        // 7 dagen terug bereikt — alleen nog live monitoring
+        if (!backwardDone) {
+          backwardDone = true;
+          console.log('[INFO] Backward scan klaar (7 dagen). Alleen live monitoring actief.');
+          await bot.sendMessage(CHAT_ID, `✅ *Backward scan klaar!*\n\n7 dagen gescand, nu alleen live monitoring.\n📋 ${contractsFound} contracten | 🔔 ${alertsSent} alerts`, { parse_mode: 'Markdown' });
+        }
+        await sleep(10000); // rustig wachten
       }
     } catch (err) {
       console.error('[MAIN] Fout:', err.message);
