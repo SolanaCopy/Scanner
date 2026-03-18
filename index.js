@@ -220,8 +220,7 @@ function saveState() {
   };
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-    // Sla ook gecheckte adressen op
-    fs.writeFileSync(CHECKED_FILE, JSON.stringify([...checkedAddresses]));
+    // Checked adressen NIET meer opslaan — vreet geheugen bij serialize/parse
   } catch (e) {
     console.error('[STATE] Save fout:', e.message);
   }
@@ -232,11 +231,8 @@ function loadState() {
     if (fs.existsSync(STATE_FILE)) {
       const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
       console.log(`[STATE] Hervat vanaf block ${state.scanBlock} (opgeslagen ${state.savedAt})`);
-      // Laad gecheckte adressen (altijd lowercase voor consistente dedup)
-      if (fs.existsSync(CHECKED_FILE)) {
-        const addrs = JSON.parse(fs.readFileSync(CHECKED_FILE, 'utf-8'));
-        addrs.forEach(a => checkedAddresses.add(a.toLowerCase()));
-        console.log(`[STATE] ${checkedAddresses.size} gecheckte adressen geladen`);
+      // Checked adressen niet meer laden — begint vers, voorkomt geheugen problemen
+      if (false) {
       }
       return state;
     }
@@ -1704,10 +1700,10 @@ async function checkContract(contractAddress, source) {
     if (SKIP_ADDRESSES.has(contractAddress.toLowerCase())) return;
     checkedAddresses.add(contractAddress.toLowerCase());
 
-    // Geheugen limiet: max 500k adressen bijhouden
-    if (checkedAddresses.size > 500000) {
+    // Geheugen limiet: max 100k adressen bijhouden
+    if (checkedAddresses.size > 100000) {
       const iter = checkedAddresses.values();
-      for (let i = 0; i < 50000; i++) {
+      for (let i = 0; i < 20000; i++) {
         checkedAddresses.delete(iter.next().value);
       }
     }
