@@ -1571,6 +1571,26 @@ _Powered by Claude AI_
 
 // === TELEGRAM ALERT STUREN + WORKER FORKEN ===
 async function sendAlert(contractAddress, totalUsd, breakdown, verified) {
+  // Laatste check: skip bekende infra
+  try {
+    const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${BSCSCAN_KEY}`;
+    const infoRes = await axios.get(infoUrl, { timeout: 10000 });
+    const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
+    const ALERT_SKIP = ['pancake','uniswap','sushi','thena','biswap','curve','algebra','nomiswap',
+      'kernel','semimodular','simpleaccount','lightaccount','biconomy','gnosissafe','gnosisproxy','safeproxy',
+      'ownbitmultisig','nervemultisig','transparentupgradeableproxy','transparentproxy','erc1967proxy',
+      'beaconproxy','adminupgradeabilityproxy','masterchef','timelock','multicall','proxyadmin',
+      'forwarderv4','forwarder','layerzero','stargate','wormhole','celer',
+      'venuspool','vtoken','comptroller','aavepool','lendingpool','dpp','dodo',
+      'treasury','chainlink','pricefeed','superstrategy','vault','swapflashloan','stableswap'];
+    const ALERT_EXACT = ['account','depository','pool','root','asset','wallet','solver','pair','factory','router','safe'];
+    if (ALERT_SKIP.some(s => cName.includes(s)) || ALERT_EXACT.includes(cName)) {
+      console.log(`[ALERT-SKIP] ${contractAddress} - ${cName} (bekende infra, geen alert)`);
+      SKIP_ADDRESSES.add(contractAddress.toLowerCase());
+      return;
+    }
+  } catch (e) {}
+
   // Balance breakdown opbouwen
   let balanceLines = '';
   for (const [token, info] of Object.entries(breakdown)) {
