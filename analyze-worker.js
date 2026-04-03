@@ -870,6 +870,35 @@ process.on('message', async (msg) => {
   console.log(`[WORKER] Analyse gestart: ${address} ($${totalUsd})`);
 
   try {
+    // 0. Naam-check: skip bekende infra VOORDAT we iets doen
+    try {
+      const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${address}&apikey=${BSCSCAN_KEY}`;
+      const infoRes = await axios.get(infoUrl, { timeout: 10000 });
+      const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
+      const SKIP_NAMES = [
+        'pancakepair', 'pancakev3pool', 'pancakev3', 'pancakestableswap', 'pancakefactory', 'pancakerouter',
+        'pancakeswap', 'pancake', 'nomiswap', 'uniswapv2pair', 'uniswapv3pool', 'uniswap',
+        'sushiswap', 'biswap', 'thena', 'apeswap', 'babyswap', 'mdex', 'algebrapool',
+        'swapflashloan', 'stableswap', 'curverpool', 'liquiditypool',
+        'kernel', 'semimodularaccount', 'simpleaccount', 'lightaccount', 'biconomyaccount',
+        'gnosissafe', 'gnosisproxy', 'gnosissafeproxy', 'safeproxy', 'safe',
+        'ownbitmultisig', 'ownbitmultisigproxy', 'nervemultisig',
+        'transparentupgradeableproxy', 'transparentproxy', 'erc1967proxy', 'beaconproxy',
+        'adminupgradeabilityproxy', 'immutableadminupgradeabilityproxy',
+        'masterchef', 'timelock', 'multicall', 'proxyadmin',
+        'forwarderv4', 'forwarder', 'layerzero', 'stargate', 'wormhole', 'celer',
+        'venuspool', 'vtoken', 'comptroller', 'aavepool', 'lendingpool',
+        'dpp', 'dodo', 'dodov2', 'treasury', 'chainlinkfeed', 'pricefeed',
+        'superstrategy', 'strategy', 'vault',
+      ];
+      const SKIP_EXACT = ['account', 'depository', 'pool', 'root', 'asset', 'wallet', 'solver', 'pair', 'factory', 'router'];
+      if (SKIP_NAMES.some(s => cName.includes(s)) || SKIP_EXACT.includes(cName)) {
+        console.log(`[WORKER] SKIP ${address} - ${cName} (bekende infra)`);
+        process.send({ done: true, address, skipped: true });
+        return;
+      }
+    } catch (e) {}
+
     // 1. Slither
     await safeSend(`🔬 *Slither analyse...*\n\`${address}\``);
     const slitherResult = await runSlither(address);
