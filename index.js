@@ -20,21 +20,28 @@ const BSC_RPC = process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org';
 const STATUS_INTERVAL = 5 * 60 * 1000; // 5 minuten
 const RENDER_URL = process.env.RENDER_URL || '';
 const SCANNER_API_KEY = process.env.SCANNER_API_KEY || '';
+const LOCAL_DASH = process.env.LOCAL_DASH || 'http://localhost:3001';
 
 // === HEARTBEAT ===
 async function sendHeartbeat() {
-  if (!RENDER_URL) return;
-  try {
-    await axios.post(`${RENDER_URL}/api/scanner/heartbeat`, {
-      blocks: blocksScanned,
-      contracts: contractsFound,
-      balance10k: contractsWithBalance,
-      alerts: alertsSent,
-      liveBlocks: liveBlocksScanned,
-      workers: activeWorkers.size
-    }, { headers: { 'X-API-Key': SCANNER_API_KEY }, timeout: 5000 });
-  } catch (e) {
-    // stil falen
+  const payload = {
+    blocks: liveBlocksScanned,
+    contracts: contractsFound,
+    balance10k: contractsWithBalance,
+    alerts: alertsSent,
+    liveBlocks: liveBlocksScanned,
+    transferHits: transferHits,
+    workers: activeWorkers.size
+  };
+  const headers = { 'X-API-Key': SCANNER_API_KEY };
+
+  // Push naar Render
+  if (RENDER_URL) {
+    try { await axios.post(`${RENDER_URL}/api/scanner/heartbeat`, payload, { headers, timeout: 5000 }); } catch (e) {}
+  }
+  // Push naar lokaal dashboard
+  if (LOCAL_DASH) {
+    try { await axios.post(`${LOCAL_DASH}/api/scanner/heartbeat`, payload, { headers, timeout: 3000 }); } catch (e) {}
   }
 }
 
@@ -106,8 +113,36 @@ const SKIP_ADDRESSES = new Set([
   '0x53d3564E06F20f89119ed6B654AB2D4f010A2b2B'.toLowerCase(), // $2M contract (uit scan)
 ]);
 
-// === INIT ===
-const provider = new ethers.JsonRpcProvider(BSC_RPC);
+// Laad dynamische skip-lijst (grote contracten ontdekt tijdens scannen)
+const DYNAMIC_SKIP_FILE = path.join(__dirname, 'skip_addresses.txt');
+try {
+  if (fs.existsSync(DYNAMIC_SKIP_FILE)) {
+    const lines = fs.readFileSync(DYNAMIC_SKIP_FILE, 'utf-8').split('\n').filter(l => l.length === 42);
+    for (const addr of lines) SKIP_ADDRESSES.add(addr);
+    console.log(`[SKIP] ${lines.length} dynamische skip-adressen geladen`);
+  }
+} catch (e) {}
+
+// === INIT (meerdere RPCs voor load balancing) ===
+const BSC_RPCS = [
+  BSC_RPC,                               // bsc-dataseed1.binance.org (hoofd)
+  'https://bsc-dataseed2.binance.org',
+  'https://bsc-dataseed3.binance.org',
+  'https://bsc-dataseed4.binance.org',
+  'https://bsc-rpc.publicnode.com',      // PublicNode
+  'https://bsc.meowrpc.com',            // MeowRPC gratis
+  'https://bsc-dataseed1.defibit.io',
+  'https://bsc-dataseed2.defibit.io',
+];
+const providers = BSC_RPCS.map(url => new ethers.JsonRpcProvider(url, undefined, { batchMaxCount: 1 }));
+let providerIndex = 0;
+const provider = providers[0]; // hoofd-provider voor subscriptions
+function getProvider() {
+  // Round-robin over alle providers
+  const p = providers[providerIndex % providers.length];
+  providerIndex++;
+  return p;
+}
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // Stablecoin contract instances
@@ -131,6 +166,7 @@ let historyScanProgress = '';
 let liveBlocksScanned = 0;
 let consecutiveErrors = 0;
 let backwardDone = false;
+let transferHits = 0; // Track B: grote stablecoin transfers
 
 // Worker tracking (max 2 gelijktijdig)
 const MAX_WORKERS = 2;
@@ -142,8 +178,26 @@ let currentScanBlock = 0; // global zodat saveState altijd werkt
 const recentContracts = [];
 const MAX_RECENT = 50;
 
-// Cache van al gecheckte adressen (voorkomt dubbel werk)
+// Cache van al gecheckte adressen — in-memory + persistent op disk
+const CHECKED_CACHE_FILE = path.join(__dirname, 'checked_cache.txt');
 const checkedAddresses = new Set();
+
+// Laad eerder gecheckte adressen van disk
+try {
+  if (fs.existsSync(CHECKED_CACHE_FILE)) {
+    const lines = fs.readFileSync(CHECKED_CACHE_FILE, 'utf-8').split('\n').filter(l => l.length === 42);
+    for (const addr of lines) checkedAddresses.add(addr);
+    console.log(`[CACHE] ${checkedAddresses.size} adressen geladen van disk`);
+  }
+} catch (e) {}
+
+// Sla cache periodiek op (elke 5 min)
+setInterval(() => {
+  try {
+    const addrs = Array.from(checkedAddresses).slice(-50000); // max 50k opslaan
+    fs.writeFileSync(CHECKED_CACHE_FILE, addrs.join('\n'));
+  } catch (e) {}
+}, 5 * 60 * 1000);
 
 // Lijst van alerts (matches)
 const recentAlerts = [];
@@ -154,7 +208,8 @@ const STATE_FILE = path.join(__dirname, 'scanner_state.json');
 const CHECKED_FILE = path.join(__dirname, 'checked_addresses.json');
 const RESULTS_FILE = path.join(__dirname, 'scan_results.json');
 
-// Analyse resultaten opslaan
+// Analyse resultaten opslaan (max 300 resultaten, daarna oudste verwijderen)
+const MAX_RESULTS = 300;
 function saveResult(address, balanceUsd, breakdown, slither, mythril, security) {
   let results = [];
   try {
@@ -199,6 +254,11 @@ function saveResult(address, balanceUsd, breakdown, slither, mythril, security) 
       findings: security.success ? security.findings.map(f => ({ category: f.category, severity: f.severity, title: f.title, detail: f.detail })) : []
     }
   });
+
+  // Houd max 300 resultaten, verwijder oudste
+  if (results.length > MAX_RESULTS) {
+    results = results.slice(-MAX_RESULTS);
+  }
 
   try {
     fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
@@ -946,7 +1006,7 @@ bot.onText(/\/fullscan/, async (msg) => {
 
 bot.onText(/\/help/, async (msg) => {
   if (msg.chat.id.toString() !== CHAT_ID) return;
-  await bot.sendMessage(CHAT_ID, `📖 *BSC Scanner - Commando's*
+  await bot.sendMessage(CHAT_ID, `📖 *BSC Scanner v4 - Commando's*
 
 ━━━━━━━━━━━━━━━━━━━━
 *Scanner:*
@@ -955,7 +1015,6 @@ bot.onText(/\/help/, async (msg) => {
 /status - Live status bekijken
 /lijst - Laatste gevonden contracten
 /alerts - Lijst van matches (alerts)
-/scan 1h - Scan verleden (1h/1d/1w/1y)
 
 *Analyse:*
 /check 0x... - Slither analyse
@@ -1597,35 +1656,28 @@ ${balanceLines}📝 *Verified:* ${verifiedIcon}
 
 // === STATUS RAPPORT ===
 async function sendStatusReport() {
-  const blocksPerMin = blocksScanned > 0 ? (blocksScanned / ((Date.now() - startTime) / 60000)).toFixed(1) : '0';
   const statusIcon = scanning ? '🟢 ACTIEF' : '🔴 GEPAUZEERD';
-  const historyLine = historyScanActive ? `\n🔄 *History scan: ${historyScanProgress}*` : '';
-  const timeScanned = blocksToTime(blocksScanned);
   const startDate = new Date(startTime).toLocaleString('nl-NL');
-  const daysBack = startBlock > 0 ? ((startBlock - currentBlockNum + blocksScanned * 2) * 3 / 86400) : 0;
-  const currentScanDaysBack = startBlock > 0 ? (((startBlock - (startBlock - 28800 - blocksScanned)) * 3) / 86400).toFixed(1) : '?';
 
-  const msg = `📊 *BSC Scanner Status*
+  const msg = `📊 *BSC Scanner v4 Status*
 
 ━━━━━━━━━━━━━━━━━━━━
-${statusIcon}${historyLine}
+${statusIcon} — Event-Driven Mode
 ⏱️ Uptime: *${uptime()}*
 📅 Gestart: *${startDate}*
 ━━━━━━━━━━━━━━━━━━━━
 
-⏪ *Backward Scan:*
-• Blocks gescand: *${blocksScanned.toLocaleString()}*
-• Nu ~*${((blocksScanned + 28800) * 3 / 86400).toFixed(1)} dagen* terug
-• Snelheid: *${blocksPerMin} blocks/min*
-
-⏩ *Live Monitoring:*
+🔵 *Track A — Nieuwe Deploys:*
 • Live blocks gescand: *${liveBlocksScanned.toLocaleString()}*
-• Analyse workers actief: *${activeWorkers.size}/${MAX_WORKERS}*
+
+🟢 *Track B — Grote Transfers:*
+• Transfers gedetecteerd: *${transferHits.toLocaleString()}*
 
 📋 *Contracten:*
 • Totaal gevonden: *${contractsFound.toLocaleString()}*
-• Met $10k+ balance: *${contractsWithBalance.toLocaleString()}*
+• Met $${(MIN_BALANCE_USD/1000).toFixed(0)}k+ balance: *${contractsWithBalance.toLocaleString()}*
 • Verified: *${verifiedContracts.toLocaleString()}*
+• Workers actief: *${activeWorkers.size}/${MAX_WORKERS}*
 
 🔔 *Alerts verzonden: ${alertsSent}*
 
@@ -1699,24 +1751,36 @@ async function checkContract(contractAddress, source) {
     if (checkedAddresses.has(contractAddress.toLowerCase())) return;
     if (SKIP_ADDRESSES.has(contractAddress.toLowerCase())) return;
     checkedAddresses.add(contractAddress.toLowerCase());
+    // Direct naar disk schrijven zodat herstart geen dubbele alerts geeft
+    try { fs.appendFileSync(CHECKED_CACHE_FILE, contractAddress.toLowerCase() + '\n'); } catch (e) {}
 
-    // Geheugen limiet: max 100k adressen bijhouden
-    if (checkedAddresses.size > 100000) {
-      const iter = checkedAddresses.values();
-      for (let i = 0; i < 20000; i++) {
-        checkedAddresses.delete(iter.next().value);
-      }
+    // Geheugen limiet: max 50k adressen bijhouden, trim oudste helft
+    if (checkedAddresses.size > 50000) {
+      const arr = Array.from(checkedAddresses);
+      const keep = arr.slice(-25000); // bewaar nieuwste 25k
+      checkedAddresses.clear();
+      for (const a of keep) checkedAddresses.add(a);
+      console.log(`[MEM] checkedAddresses getrimd: 50k -> ${checkedAddresses.size}`);
     }
-
-    // Skip proxy contracten
-    const proxy = await isProxy(contractAddress);
-    if (proxy) return;
 
     contractsFound++;
 
     const { totalUsd, breakdown } = await getTotalBalance(contractAddress);
     const hasBalance = totalUsd >= MIN_BALANCE_USD;
 
+    // Skip mega-contracten (>$5M = grote bekende protocollen, geen targets)
+    const MAX_BALANCE_USD = 5000000;
+    if (totalUsd > MAX_BALANCE_USD) {
+      console.log(`[SKIP] ${contractAddress} - $${totalUsd.toFixed(0)} (te groot, waarschijnlijk bekend protocol)`);
+      SKIP_ADDRESSES.add(contractAddress.toLowerCase());
+      // Persist naar disk zodat hij na restart ook geskipt wordt
+      try { fs.appendFileSync(DYNAMIC_SKIP_FILE, contractAddress.toLowerCase() + '\n'); } catch (e) {}
+      return;
+    }
+
+    if (totalUsd > 100) {
+      console.log(`[BAL] ${contractAddress} - $${totalUsd.toFixed(0)} (${source})`);
+    }
     if (hasBalance) contractsWithBalance++;
 
     const contractInfo = {
@@ -1734,6 +1798,58 @@ async function checkContract(contractAddress, source) {
       const verified = await isVerified(contractAddress);
       contractInfo.verified = verified;
       if (verified) {
+        // Check contractnaam — skip bekende DEX/infra contracten
+        try {
+          const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${BSCSCAN_KEY}`;
+          const infoRes = await axios.get(infoUrl);
+          const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
+          const SKIP_NAMES = [
+            // DEX pools & routers & LP
+            'pancakepair', 'pancakev3pool', 'pancakev3', 'pancakestableswap', 'pancakefactory', 'pancakerouter',
+            'pancakeswap', 'pancake', 'nomiswapstable', 'nomiswap',
+            'uniswapv2pair', 'uniswapv3pool', 'uniswapv2factory', 'uniswapv2router', 'uniswap',
+            'algebrapool', 'algebrafactory',
+            'sushiswap', 'sushipool', 'sushirouter',
+            'thenapool', 'thenafusion', 'thenagauge',
+            'biswappair', 'biswapfactory', 'biswap',
+            'apeswap', 'babyswap', 'bakeryswap', 'mdex',
+            'swapflashloan', 'stableswap', 'curverpool', 'curvepool',
+            'liquiditypool', 'ammpool', 'tradingpool',
+            // Wallets & account abstraction (ERC-4337)
+            'kernel', 'semimodularaccount', 'semimodularaccountbytecode',
+            'simpleaccount', 'lightaccount', 'biconomyaccount',
+            'gnosissafe', 'gnosisproxy', 'gnosissafeproxy', 'safeproxy', 'safe',
+            'ownbitmultisig', 'ownbitmultisigproxy', 'paymentwallet', 'tokenwallet',
+            'nervemultisig',
+            // Proxies & infra
+            'transparentupgradeableproxy', 'transparentproxy',
+            'erc1967proxy', 'beaconproxy', 'stakingproxy',
+            'immutableadminupgradeabilityproxy', 'adminupgradeabilityproxy',
+            'masterchef', 'masterstaking', 'timelock', 'multicall', 'proxyadmin',
+            'forwarderv4', 'forwarder',
+            // Bridges & cross-chain
+            'originaltokenbridge', 'multiplibridger', 'layerzero', 'stargate',
+            'wormhole', 'celer', 'multichain', 'anyswap',
+            // Lending & bekende protocols
+            'venuspool', 'vtoken', 'vbep', 'comptroller',
+            'aavepool', 'aavetoken', 'lendingpool',
+            'alpacafinance', 'alpacavault',
+            // Overig infra
+            'payrollinstance', 'dpp', 'dodo', 'dodov2',
+            'treasury', 'arbitragetreasury',
+            'escrowsrc', 'rfqrouter', 'spoke',
+            'chainlinkfeed', 'chainlinkoracle', 'pricefeed',
+            'superstrategy', 'strategy', 'vault', 'strategymanager',
+          ];
+          // Exacte naam matches voor generieke smart wallet/infra namen
+          const SKIP_EXACT = ['account', 'depository', 'pool', 'root', 'asset', 'wallet', 'solver', 'pair', 'factory', 'router'];
+          if (SKIP_NAMES.some(s => cName.includes(s)) || SKIP_EXACT.includes(cName)) {
+            console.log(`[SKIP] ${contractAddress} - ${cName} (bekende infra)`);
+            SKIP_ADDRESSES.add(contractAddress.toLowerCase());
+            try { fs.appendFileSync(DYNAMIC_SKIP_FILE, contractAddress.toLowerCase() + '\n'); } catch (e) {}
+            return;
+          }
+        } catch (e) {}
         verifiedContracts++;
         await sendAlert(contractAddress, totalUsd, breakdown, verified);
       }
@@ -1746,48 +1862,21 @@ async function checkContract(contractAddress, source) {
   }
 }
 
-// === BLOCK SCANNEN ===
+// === TRACK A: BLOCK SCANNEN (alleen nieuwe deploys) ===
 async function scanBlock(blockNumber) {
   try {
-    const block = await provider.getBlock(blockNumber, true);
+    const p = getProvider();
+    const block = await p.getBlock(blockNumber, true);
     if (!block || !block.prefetchedTransactions) return;
 
-    // 1) Nieuwe contracten (tx.to === null)
+    // Alleen nieuwe contracten (tx.to === null)
     const contractTxs = block.prefetchedTransactions.filter(tx => tx.to === null);
     for (const tx of contractTxs) {
       try {
-        const receipt = await provider.getTransactionReceipt(tx.hash);
+        const receipt = await p.getTransactionReceipt(tx.hash);
         if (!receipt || !receipt.contractAddress) continue;
-        await checkContract(receipt.contractAddress, 'new');
+        await checkContract(receipt.contractAddress, 'deploy');
       } catch (err) {}
-    }
-
-    // 2) Bestaande contracten die transacties ontvangen
-    // Pak unieke to-adressen (skip null, al gecheckte, en bekende skip-adressen)
-    const toAddresses = new Set();
-    for (const tx of block.prefetchedTransactions) {
-      if (tx.to) {
-        const addr = tx.to.toLowerCase();
-        if (!checkedAddresses.has(addr) && !SKIP_ADDRESSES.has(addr)) {
-          toAddresses.add(tx.to);
-        }
-      }
-    }
-
-    // Check max 5 adressen per block (snelheid + minder dubbel werk)
-    let checked = 0;
-    for (const addr of toAddresses) {
-      if (checked >= 5) break;
-      // Voeg meteen toe aan checked om dubbels in volgende blocks te voorkomen
-      checkedAddresses.add(addr.toLowerCase());
-      try {
-        // Check of het een contract is (heeft code)
-        const code = await provider.getCode(addr);
-        if (code && code !== '0x') {
-          await checkContract(addr, 'existing');
-        }
-      } catch (err) {}
-      checked++;
     }
   } catch (err) {
     console.error(`[SCAN] Fout bij block ${blockNumber}:`, err.message);
@@ -1802,21 +1891,113 @@ async function scanBlock(blockNumber) {
   consecutiveErrors = 0;
 }
 
+// === TRACK B: STABLECOIN TRANSFER MONITORING ===
+// Luister naar grote Transfer events (>$3k) naar contracten
+const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+const TRANSFER_MIN_USD = MIN_BALANCE_USD; // zelfde drempel als balance check
+
+// Dedup voor transfer checks: voorkom dat we hetzelfde adres elke seconde checken
+const recentTransferChecks = new Map(); // address -> timestamp
+// Cleanup elke 10 minuten
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [addr, ts] of recentTransferChecks) {
+    if (ts < cutoff) recentTransferChecks.delete(addr);
+  }
+}, 60000);
+
+async function handleTransferLog(log) {
+  try {
+    if (!scanning) return;
+    // Decode: Transfer(from, to, value)
+    const from = '0x' + log.topics[1].slice(26);
+    const to = '0x' + log.topics[2].slice(26);
+    const toAddr = to.toLowerCase();
+
+    // Skip bekende infra-adressen (DEX routers, bridges, etc.)
+    if (SKIP_ADDRESSES.has(toAddr)) return;
+
+    // Dedup: skip als we dit adres de laatste 10 min al via transfer gecheckt hebben
+    if (recentTransferChecks.has(toAddr)) return;
+
+    // Bepaal welke stablecoin dit is
+    const tokenAddr = log.address.toLowerCase();
+    const stablecoin = STABLECOINS.find(s => s.address.toLowerCase() === tokenAddr);
+    if (!stablecoin) return;
+
+    // Decode het bedrag
+    const value = BigInt(log.data);
+    const amount = parseFloat(ethers.formatUnits(value, stablecoin.decimals));
+
+    // Skip kleine transfers
+    if (amount < TRANSFER_MIN_USD) return;
+
+    // Check of het een contract is (niet een wallet)
+    const code = await getProvider().getCode(to);
+    if (!code || code === '0x') return;
+
+    transferHits++;
+    recentTransferChecks.set(toAddr, Date.now());
+    console.log(`[TRANSFER] ${stablecoin.name} $${amount.toFixed(0)} naar contract ${to.slice(0, 10)}...`);
+
+    // Als dit adres al door de volledige pipeline is geweest, doe alleen balance check
+    if (checkedAddresses.has(toAddr)) {
+      try {
+        const { totalUsd, breakdown } = await getTotalBalance(to);
+        if (totalUsd >= MIN_BALANCE_USD) {
+          console.log(`[TRANSFER-HIT] ${to} heeft nu $${totalUsd.toFixed(0)} (via ${stablecoin.name} transfer)`);
+        }
+      } catch (e) {}
+      return;
+    }
+
+    // Nieuw contract: volledige pipeline
+    await checkContract(to, `transfer-${stablecoin.name}`);
+  } catch (err) {
+    // Stil falen
+  }
+}
+
+// Filter-based transfer monitoring met automatische filter-recreatie
+let lastTransferBlock = 0;
+
+function startTransferMonitoring() {
+  // Aparte provider voor transfer monitoring (zonder batchMaxCount limiet)
+  const transferProvider = new ethers.JsonRpcProvider(BSC_RPC);
+
+  function attachFilters() {
+    // Verwijder oude listeners
+    transferProvider.removeAllListeners();
+    // Maak nieuwe filters aan
+    for (const sc of STABLECOINS) {
+      const filter = { address: sc.address, topics: [TRANSFER_TOPIC] };
+      transferProvider.on(filter, handleTransferLog);
+      console.log(`[TRANSFER] Filter aangemaakt voor ${sc.name}`);
+    }
+  }
+
+  attachFilters();
+  console.log(`[TRANSFER] Filter-based monitoring gestart (>$${TRANSFER_MIN_USD} naar contracten)`);
+
+  // Hermaak filters elke 3 minuten (voorkomt "filter not found" errors)
+  setInterval(() => {
+    console.log('[TRANSFER] Filters vernieuwen...');
+    attachFilters();
+  }, 3 * 60 * 1000);
+}
+
 // === LIVE UPDATE (elke 5 min) ===
 async function sendLiveUpdate() {
   if (!scanning) return;
 
-  const blocksPerMin = blocksScanned > 0 ? (blocksScanned / ((Date.now() - startTime) / 60000)).toFixed(1) : '0';
-  const historyLine = historyScanActive ? `\n🔄 History scan: ${historyScanProgress}` : '';
-
-  const daysBack = ((blocksScanned + 28800) * 3 / 86400).toFixed(1);
-
   const msg = `📡 *Live Update*
 
-⏪ ~${daysBack} dagen terug | ⏩ ${liveBlocksScanned} live blocks
-🔢 ${blocksScanned.toLocaleString()} blocks | 📋 ${contractsFound.toLocaleString()} contracten
-💰 ${contractsWithBalance} met $10k+ | 🔔 ${alertsSent} alerts
-⚡ ${blocksPerMin} blocks/min | 🔧 ${activeWorkers.size}/${MAX_WORKERS} workers${historyLine}`;
+⏩ ${liveBlocksScanned} live blocks gescand
+💸 ${transferHits} grote transfers gedetecteerd
+📋 ${contractsFound.toLocaleString()} contracten gevonden
+💰 ${contractsWithBalance} met $${(MIN_BALANCE_USD/1000).toFixed(0)}k+ | 🔔 ${alertsSent} alerts
+🔧 ${activeWorkers.size}/${MAX_WORKERS} workers
+⏱ Uptime: ${uptime()}`;
 
   try {
     await bot.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
@@ -1827,7 +2008,7 @@ async function sendLiveUpdate() {
 
 // === MAIN LOOP ===
 async function main() {
-  console.log('=== BSC Contract Scanner v3 ===');
+  console.log('=== BSC Contract Scanner v4 (Event-Driven) ===');
   console.log(`Min balance: $${MIN_BALANCE_USD}`);
   console.log(`Chat ID: ${CHAT_ID}`);
   console.log('');
@@ -1836,121 +2017,86 @@ async function main() {
 
   setInterval(updateBnbPrice, 5 * 60 * 1000);
   setInterval(sendLiveUpdate, STATUS_INTERVAL);
-  setInterval(sendHeartbeat, 60000); // heartbeat elke minuut
-  sendHeartbeat(); // direct eerste heartbeat
+  setInterval(sendHeartbeat, 60000);
+  sendHeartbeat();
+
+  // State laden (alleen counters, geen backward scan meer)
+  const savedState = loadState();
+  if (savedState) {
+    alertsSent = savedState.alertsSent || 0;
+    if (savedState.recentAlerts) {
+      recentAlerts.push(...savedState.recentAlerts.map(a => ({ ...a, time: new Date(a.time) })));
+    }
+    console.log(`[STATE] Counters geladen (${alertsSent} alerts)`);
+  }
 
   const currentBlock = await provider.getBlockNumber();
   currentBlockNum = currentBlock;
   startBlock = currentBlock;
 
-  await bot.sendMessage(CHAT_ID, `🚀 *BSC Scanner v3 Gestart!*
+  await bot.sendMessage(CHAT_ID, `🚀 *BSC Scanner v4 Gestart!*
 
 ━━━━━━━━━━━━━━━━━━━━
-⚙️ *Instellingen:*
-• Min balance: *$${MIN_BALANCE_USD.toLocaleString()}*
-• Filter: Verified ✅ + Balance 💰 (BNB+USDT+USDC+BUSD)
+⚙️ *Modus: Event-Driven*
+• 🔵 Track A: Nieuwe contract deploys (real-time)
+• 🟢 Track B: Grote stablecoin transfers (>$${(MIN_BALANCE_USD/1000).toFixed(0)}k)
+• Filter: Verified ✅ + Balance 💰
 • BNB prijs: *$${bnbPriceUsd.toFixed(2)}*
-• Live updates: elke 5 min
 ━━━━━━━━━━━━━━━━━━━━
 
 📖 *Commando's:*
 /status - Live status
 /lijst - Gevonden contracten
 /alerts - Matches lijst
-/scan 1h - Extra scan periode
 /stop - Pauzeren
-/help - Alle commando's
-
-⏪ Start met scannen van laatste 24u, daarna steeds verder terug...`, { parse_mode: 'Markdown' });
+/help - Alle commando's`, { parse_mode: 'Markdown' });
 
   console.log(`[START] Huidig block: ${currentBlock}`);
 
-  // Probeer vorige state te laden
-  const blocksPerDay = 28800;
-  let scanBlock_num;
-  const savedState = loadState();
+  // === TRACK A: LIVE BLOCK MONITORING (polling, geen filters) ===
+  let lastScannedBlock = currentBlock;
+  (async () => {
+    while (true) {
+      if (!scanning) { await sleep(5000); continue; }
+      try {
+        const latest = await provider.getBlockNumber();
+        if (latest <= lastScannedBlock) { await sleep(3000); continue; }
 
-  const maxBackBlock = currentBlock - (7 * blocksPerDay); // max 7 dagen terug
-  if (savedState && savedState.scanBlock && savedState.scanBlock > maxBackBlock) {
-    scanBlock_num = savedState.scanBlock - 1;
-    blocksScanned = savedState.blocksScanned || 0;
-    contractsFound = savedState.contractsFound || 0;
-    contractsWithBalance = savedState.contractsWithBalance || 0;
-    verifiedContracts = savedState.verifiedContracts || 0;
-    alertsSent = savedState.alertsSent || 0;
-    if (savedState.recentAlerts) {
-      recentAlerts.push(...savedState.recentAlerts.map(a => ({ ...a, time: new Date(a.time) })));
-    }
-    const daysBack = ((currentBlock - scanBlock_num) * 3 / 86400).toFixed(1);
-    console.log(`[START] Hervat vanaf ~${daysBack} dagen terug (block ${scanBlock_num})`);
-
-    await bot.sendMessage(CHAT_ID, `🔄 *Scanner Hervat!*\n\n⏪ Verder vanaf ~*${daysBack} dagen* terug\n📦 Al gescand: *${blocksScanned.toLocaleString()}* blocks\n📋 Contracten: *${contractsFound}* | Alerts: *${alertsSent}*`, { parse_mode: 'Markdown' });
-  } else {
-    // State te oud of niet aanwezig — begin opnieuw vanaf 24u terug
-    scanBlock_num = currentBlock - blocksPerDay;
-    checkedAddresses.clear();
-    console.log(`[START] Begin vers vanaf 24u geleden (state te oud of niet aanwezig)`);
-  }
-
-  // === LIVE BLOCK MONITORING (vooruit) ===
-  provider.on('block', async (blockNumber) => {
-    if (!scanning) return;
-    try {
-      await scanBlock(blockNumber);
-      liveBlocksScanned++;
-      if (liveBlocksScanned % 20 === 0) {
-        console.log(`[LIVE] ${liveBlocksScanned} live blocks gescand (laatste: ${blockNumber})`);
+        // Scan alle gemiste blocks (max 5 per keer, met pauze ertussen)
+        const end = Math.min(lastScannedBlock + 5, latest);
+        for (let b = lastScannedBlock + 1; b <= end; b++) {
+          try {
+            await scanBlock(b);
+            liveBlocksScanned++;
+            if (liveBlocksScanned % 20 === 0) {
+              console.log(`[LIVE] ${liveBlocksScanned} blocks gescand (laatste: ${b})`);
+            }
+            if (liveBlocksScanned % 100 === 0) {
+              currentScanBlock = b;
+              saveState();
+            }
+          } catch (err) {
+            // Stil falen per block
+          }
+          await sleep(500); // pauze tussen blocks tegen rate limit
+        }
+        lastScannedBlock = end;
+      } catch (err) {
+        console.error('[LIVE] Poll error:', err.message);
+        await sleep(10000);
       }
-    } catch (err) {
-      // Stil falen, niet loggen voor elk block
+      await sleep(3000);
     }
-  });
-  console.log('[LIVE] Live block monitoring actief');
+  })();
+  console.log('[TRACK A] Polling-based block monitoring actief (nieuwe deploys)');
 
-  // === BACKWARD SCAN LOOP ===
+  // === TRACK B: STABLECOIN TRANSFER EVENTS (polling) ===
+  startTransferMonitoring();
+  console.log('[TRACK B] Polling-based transfer monitoring actief');
+
+  // Houd process draaiend
   while (true) {
-    if (!scanning) {
-      await sleep(3000);
-      continue;
-    }
-
-    // Skip als history scan actief is (analyse blokkeert NIET meer)
-    if (historyScanActive) {
-      await sleep(3000);
-      continue;
-    }
-
-    try {
-      // Scan 1 block verder terug (max 7 dagen)
-      const maxBackBlock = currentBlock - (7 * 28800); // 7 dagen × 28800 blocks/dag
-      if (scanBlock_num > maxBackBlock) {
-        await scanBlock(scanBlock_num);
-        blocksScanned++;
-        scanBlock_num--;
-        currentScanBlock = scanBlock_num;
-
-        if (blocksScanned % 10 === 0) {
-          saveState();
-        }
-        if (blocksScanned % 100 === 0) {
-          const daysBack = ((currentBlock - scanBlock_num) * 3 / 86400).toFixed(1);
-          console.log(`[INFO] ${blocksScanned} blocks | ${contractsFound} contracten | ${contractsWithBalance} $10k+ | ${alertsSent} alerts | ~${daysBack} dagen terug | ⏩ ${liveBlocksScanned} live | 🔧 ${activeWorkers.size} workers`);
-        }
-
-        await sleep(200);
-      } else {
-        // 7 dagen terug bereikt — alleen nog live monitoring
-        if (!backwardDone) {
-          backwardDone = true;
-          console.log('[INFO] Backward scan klaar (7 dagen). Alleen live monitoring actief.');
-          await bot.sendMessage(CHAT_ID, `✅ *Backward scan klaar!*\n\n7 dagen gescand, nu alleen live monitoring.\n📋 ${contractsFound} contracten | 🔔 ${alertsSent} alerts`, { parse_mode: 'Markdown' });
-        }
-        await sleep(10000); // rustig wachten
-      }
-    } catch (err) {
-      console.error('[MAIN] Fout:', err.message);
-      await sleep(5000);
-    }
+    await sleep(30000);
   }
 }
 
