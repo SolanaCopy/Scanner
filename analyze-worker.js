@@ -9,7 +9,9 @@ const path = require('path');
 
 const SLITHER_PATH = 'C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts/slither.exe';
 const SOLC_PATH = 'C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts/solc.exe';
-const MYTHRIL_PATH = 'C:/Users/moham/AppData/Local/Programs/Python/Python311/Scripts/myth.exe';
+const MYTHRIL_DOCKER = 'mythril/myth'; // Mythril via Docker
+const ECHIDNA_DOCKER = 'ghcr.io/crytic/echidna/echidna'; // Echidna via Docker
+const DOCKER_ENV = { ...process.env, PATH: (process.env.PATH || '') + ';C:\\Program Files\\Docker\\Docker\\resources\\bin' };
 const BSCSCAN_KEY = process.env.BSCSCAN_API_KEY;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -188,23 +190,17 @@ async function runMythril(address) {
 
     const versionMatch = compilerVersion.match(/v?(\d+\.\d+\.\d+)/);
     let solcVersion = '0.8.20';
-    if (versionMatch) {
-      solcVersion = versionMatch[1];
-      try {
-        execSync(`C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts/solc-select install ${solcVersion}`, { timeout: 30000 });
-        execSync(`C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts/solc-select use ${solcVersion}`, { timeout: 10000 });
-      } catch (e) {}
-    }
+    if (versionMatch) solcVersion = versionMatch[1];
 
-    const winPath = mainFile.replace(/\//g, '\\');
-    const solcBinary = SOLC_PATH.replace(/\//g, '\\');
+    // Docker mount: tmpDir -> /tmp/mythril in container
+    const dockerTmpDir = tmpDir.replace(/\\/g, '/');
+    const containerFile = `/tmp/mythril/${contractName}.sol`;
     let output = '';
-    const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', SOLC_BINARY: solcBinary, PATH: process.env.PATH + ';C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts' };
 
     for (const solcArgs of ['', ' --solc-args "--via-ir --optimize"']) {
-      const cmd = `"${MYTHRIL_PATH}" analyze "${winPath}" --solv ${solcVersion} -o json --execution-timeout 120${solcArgs}`;
+      const cmd = `docker run --rm -v "${dockerTmpDir}:/tmp/mythril" ${MYTHRIL_DOCKER} analyze ${containerFile} --solv ${solcVersion} -o json --execution-timeout 120${solcArgs}`;
       try {
-        output = execSync(cmd, { timeout: 300000, encoding: 'utf-8', cwd: tmpDir, env });
+        output = execSync(cmd, { timeout: 300000, encoding: 'utf-8', env: DOCKER_ENV });
         break;
       } catch (e) {
         output = e.stdout || e.stderr || '';
@@ -392,7 +388,7 @@ async function runAIAnalysis(address, sourceCode, slitherFindings, mythrilIssues
     const prompt = `Je bent een blockchain security expert. Analyseer dit BSC smart contract op:\n1. BUSINESS LOGIC BUGS\n2. DIEFSTAL RISICO - Kan iemand ZONDER owner te zijn geld stelen?\n3. RUGPULL MECHANISMES\n4. EXPLOITS\n\nEerder gevonden (ga hier NIET op in):\n${previousFindings.join('\n')}\n\nContract: ${address}\n\`\`\`solidity\n${trimmedSource}\n\`\`\`\n\nMax 5 findings, alleen echte risico's. Format: 🔴/🟡 titel + uitleg 1-2 zinnen. Nederlands. Kort.`;
 
     const response = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-6-20250514', max_tokens: 1000,
+      model: 'claude-sonnet-4-20250514', max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }]
     }, {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
@@ -402,14 +398,283 @@ async function runAIAnalysis(address, sourceCode, slitherFindings, mythrilIssues
   } catch (err) { console.error('[WORKER-AI] Fout:', err.message); return null; }
 }
 
+// === FOUNDRY ON-CHAIN SCAN (cast) ===
+const CAST_PATH = 'C:/Users/moham/.foundry/bin/cast';
+const BSC_RPC = process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org';
+
+async function runFoundryScan(address) {
+  const findings = [];
+  const run = (cmd) => {
+    try { return execSync(cmd, { timeout: 15000, encoding: 'utf-8', env: { ...process.env, PATH: process.env.PATH + ';C:/Users/moham/.foundry/bin' } }).trim(); } catch (e) { return ''; }
+  };
+
+  try {
+    // 1. Check owner storage slot 0 (veel contracten slaan owner op in slot 0)
+    const slot0 = run(`"${CAST_PATH}" storage ${address} 0 --rpc-url ${BSC_RPC}`);
+    if (slot0 && slot0 !== '0x0000000000000000000000000000000000000000000000000000000000000000') {
+      // Check of owner() callable is
+      const owner = run(`"${CAST_PATH}" call ${address} "owner()(address)" --rpc-url ${BSC_RPC}`);
+      if (owner && owner !== '0x0000000000000000000000000000000000000000') {
+        findings.push({ check: 'OWNER', severity: 'INFO', detail: `Owner: ${owner}` });
+
+        // Check of owner een EOA of contract is
+        const ownerCode = run(`"${CAST_PATH}" code ${owner} --rpc-url ${BSC_RPC}`);
+        if (!ownerCode || ownerCode === '0x') {
+          findings.push({ check: 'EOA_OWNER', severity: 'MEDIUM', detail: 'Owner is een EOA (geen multisig/timelock)' });
+        }
+      }
+    }
+
+    // 2. Check proxy — EIP-1967 implementation slot
+    const implSlot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+    const implRaw = run(`"${CAST_PATH}" storage ${address} ${implSlot} --rpc-url ${BSC_RPC}`);
+    if (implRaw && implRaw !== '0x0000000000000000000000000000000000000000000000000000000000000000') {
+      const implAddr = '0x' + implRaw.slice(26);
+      findings.push({ check: 'PROXY', severity: 'MEDIUM', detail: `Upgradeable proxy → impl: ${implAddr}` });
+
+      // Check of implementatie verified is
+      try {
+        const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getabi&address=${implAddr}&apikey=${BSCSCAN_KEY}`;
+        const res = await axios.get(url);
+        if (res.data.status !== '1') {
+          findings.push({ check: 'UNVERIFIED_IMPL', severity: 'HIGH', detail: `Implementatie ${implAddr} is NIET verified` });
+        }
+      } catch (e) {}
+    }
+
+    // 3. Check paused state
+    const paused = run(`"${CAST_PATH}" call ${address} "paused()(bool)" --rpc-url ${BSC_RPC}`);
+    if (paused === 'true') {
+      findings.push({ check: 'PAUSED', severity: 'HIGH', detail: 'Contract is momenteel GEPAUZEERD' });
+    }
+
+    // 4. Check totalSupply vs balance (token drain indicator)
+    const totalSupply = run(`"${CAST_PATH}" call ${address} "totalSupply()(uint256)" --rpc-url ${BSC_RPC}`);
+    if (totalSupply && totalSupply !== '0') {
+      findings.push({ check: 'TOKEN', severity: 'INFO', detail: `TotalSupply: ${totalSupply}` });
+    }
+
+    // 5. Check selfdestruct in bytecode
+    const bytecode = run(`"${CAST_PATH}" code ${address} --rpc-url ${BSC_RPC}`);
+    if (bytecode && bytecode.toLowerCase().includes('ff')) {
+      // ff = SELFDESTRUCT opcode — check meer specifiek
+      const opcodes = bytecode.toLowerCase();
+      // SELFDESTRUCT = 0xff, maar ff kan ook in PUSH data zitten
+      // Simpele heuristiek: als bytecode kort is en ff bevat, waarschijnlijk selfdestruct
+      if (bytecode.length < 2000 && opcodes.includes('ff')) {
+        findings.push({ check: 'SELFDESTRUCT_BYTECODE', severity: 'MEDIUM', detail: 'Mogelijke SELFDESTRUCT in bytecode (kort contract)' });
+      }
+    }
+
+    // 6. Check contract age
+    const creationTx = run(`"${CAST_PATH}" age ${address} --rpc-url ${BSC_RPC}`);
+    if (creationTx) {
+      findings.push({ check: 'AGE', severity: 'INFO', detail: `Contract age: ${creationTx}` });
+    }
+
+    return { success: true, findings };
+  } catch (err) {
+    return { success: false, error: err.message, findings };
+  }
+}
+
+function formatFoundryReport(address, result) {
+  if (!result.success && result.findings.length === 0) {
+    return `⚠️ *Foundry Scan Mislukt*\n\`${address}\``;
+  }
+  const findings = result.findings;
+  if (findings.length === 0) return null; // Niks interessants
+
+  const high = findings.filter(f => f.severity === 'HIGH');
+  const medium = findings.filter(f => f.severity === 'MEDIUM');
+  const info = findings.filter(f => f.severity === 'INFO');
+
+  let msg = `🔧 *Foundry On-Chain Scan*\n━━━━━━━━━━━━━━━━━━━━\n\`${address}\`\n\n`;
+
+  for (const f of [...high, ...medium]) {
+    const icon = f.severity === 'HIGH' ? '🔴' : '🟡';
+    msg += `${icon} *${f.check}* — ${f.detail}\n`;
+  }
+  for (const f of info) {
+    msg += `ℹ️ *${f.check}* — ${f.detail}\n`;
+  }
+
+  return msg;
+}
+
+// === ECHIDNA FUZZING ===
+async function runEchidna(address) {
+  try {
+    const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${address}&apikey=${BSCSCAN_KEY}`;
+    const res = await axios.get(url);
+    if (res.data.status !== '1' || !res.data.result[0].SourceCode) return { success: false, error: 'Source niet beschikbaar' };
+
+    const contract = res.data.result[0];
+    const contractName = contract.ContractName || 'Contract';
+    const compilerVersion = contract.CompilerVersion || '';
+    let sourceCode = contract.SourceCode;
+
+    const tmpDir = path.join(__dirname, 'tmp_echidna', address);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    let mainFile = path.join(tmpDir, `${contractName}.sol`);
+
+    // Flatten multi-file contracts (zelfde logica als Mythril)
+    if (sourceCode.startsWith('{{')) {
+      try {
+        const parsed = JSON.parse(sourceCode.slice(1, -1));
+        const sources = parsed.sources || parsed;
+        const files = Object.keys(sources);
+        const imports = {};
+        for (const f of files) {
+          const content = sources[f].content || sources[f];
+          imports[f] = [];
+          for (const line of content.split('\n')) {
+            const m = line.trim().match(/^import\s+.*["'](.+?)["']/);
+            if (m) {
+              const imp = m[1];
+              let resolved = imp;
+              if (imp.startsWith('.')) {
+                const dir = f.substring(0, f.lastIndexOf('/'));
+                const parts = (dir + '/' + imp).split('/');
+                const normalized = [];
+                for (const p of parts) { if (p === '..') normalized.pop(); else if (p !== '.') normalized.push(p); }
+                resolved = normalized.join('/');
+              }
+              const match = files.find(k => k === resolved) || files.find(k => k === imp) || files.find(k => k.endsWith(resolved));
+              if (match && !imports[f].includes(match)) imports[f].push(match);
+            }
+          }
+        }
+        const ordered = []; const visited = new Set();
+        function visit(f) { if (visited.has(f)) return; visited.add(f); for (const dep of (imports[f] || [])) visit(dep); ordered.push(f); }
+        for (const f of files) visit(f);
+        let flatCode = ''; let licenseAdded = false; let pragmaAdded = false;
+        for (const filePath of ordered) {
+          const content = sources[filePath].content || sources[filePath];
+          for (const line of content.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('import ')) continue;
+            if (trimmed.startsWith('// SPDX-License')) { if (licenseAdded) continue; licenseAdded = true; }
+            if (trimmed.startsWith('pragma solidity')) { if (pragmaAdded) continue; pragmaAdded = true; }
+            flatCode += line + '\n';
+          }
+        }
+        sourceCode = flatCode;
+      } catch (e) { /* gebruik originele sourceCode */ }
+    }
+
+    // Schrijf contract + echidna config
+    fs.writeFileSync(mainFile, sourceCode);
+
+    const versionMatch = compilerVersion.match(/v?(\d+\.\d+\.\d+)/);
+    const solcVersion = versionMatch ? versionMatch[1] : '0.8.20';
+
+    // Echidna config: assertion mode (detecteert assert failures + reverts automatisch)
+    const config = {
+      testMode: 'assertion',
+      testLimit: 10000,
+      timeout: 90,
+      seqLen: 50,
+      format: 'text',
+      codeSize: '0xffffffff',
+      shrinkLimit: 2500,
+    };
+    fs.writeFileSync(path.join(tmpDir, 'echidna.yaml'), Object.entries(config).map(([k,v]) => `${k}: ${v}`).join('\n'));
+
+    // Docker run
+    const dockerTmpDir = tmpDir.replace(/\\/g, '/');
+    const cmd = `docker run --rm -v "${dockerTmpDir}:/src" ${ECHIDNA_DOCKER} echidna /src/${contractName}.sol --contract ${contractName} --config /src/echidna.yaml --solc-version ${solcVersion} 2>&1`;
+
+    let output = '';
+    try {
+      output = execSync(cmd, { timeout: 180000, encoding: 'utf-8', env: DOCKER_ENV });
+    } catch (e) {
+      output = (e.stdout || '') + (e.stderr || '');
+    }
+
+    // Cleanup
+    setTimeout(() => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {} }, 5000);
+
+    // Parse resultaten
+    const issues = [];
+    const lines = output.split('\n');
+    for (const line of lines) {
+      // Echidna meldt "assertion in <function>: FAILED!" of "echidna_<prop>: FAILED!"
+      if (line.includes('FAILED')) {
+        const match = line.match(/(.+?):\s*FAILED/i);
+        issues.push({
+          type: 'assertion_failure',
+          detail: match ? match[1].trim() : line.trim(),
+          severity: 'High'
+        });
+      }
+      // Reverts detecteren
+      if (line.includes('REVERT') && !line.includes('PASSED')) {
+        issues.push({
+          type: 'revert_detected',
+          detail: line.trim().substring(0, 300),
+          severity: 'Medium'
+        });
+      }
+    }
+
+    // Check of echidna ueberhaupt iets nuttigs vond
+    const passed = lines.filter(l => l.includes('PASSED')).length;
+    const failed = issues.filter(i => i.type === 'assertion_failure').length;
+
+    return {
+      success: true,
+      issues,
+      passed,
+      failed,
+      contractName,
+      compilerVersion,
+      rawOutput: output.substring(0, 2000)
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function formatEchidnaReport(address, result) {
+  if (!result.success) {
+    const safeError = (result.error || '').replace(/[`*_\[\]()~>#+=|{}.!\\-]/g, ' ').substring(0, 300);
+    return `❌ *Echidna Fuzzing Mislukt*\n\`${address}\`\nFout: ${safeError}`;
+  }
+
+  const failed = result.failed || 0;
+  const passed = result.passed || 0;
+  const assertions = result.issues.filter(i => i.type === 'assertion_failure');
+
+  let riskLevel = '🟢 GEEN ISSUES';
+  if (failed > 0) riskLevel = '🔴 ASSERTION FAILURES';
+
+  let msg = `🦔 *Echidna Fuzzing*\n━━━━━━━━━━━━━━━━━━━━\n📋 *Contract:* ${result.contractName || 'Onbekend'}\n\`${address}\`\n${riskLevel}\n━━━━━━━━━━━━━━━━━━━━\n\n📊 *Resultaten:* ✅ ${passed} passed | ❌ ${failed} failed\n`;
+
+  if (assertions.length > 0) {
+    msg += `\n⚠️ *Failed Assertions:*\n`;
+    for (const a of assertions.slice(0, 5)) {
+      msg += `🔴 ${a.detail.substring(0, 200)}\n`;
+    }
+  }
+
+  if (failed === 0 && passed > 0) msg += `\n✅ Alle fuzzing tests doorstaan (${passed} properties)\n`;
+
+  msg += `\n━━━━━━━━━━━━━━━━━━━━\n🔗 [BSCScan](https://bscscan.com/address/${address})`;
+  return msg;
+}
+
 // === SAVE RESULT ===
-function saveResult(address, balanceUsd, breakdown, slither, mythril, security) {
+function saveResult(address, balanceUsd, breakdown, slither, mythril, security, echidna) {
+  echidna = echidna || { success: false };
   let results = [];
   try { if (fs.existsSync(RESULTS_FILE)) results = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf-8')); } catch (e) {}
 
   const totalHigh = (slither.success ? slither.findings.filter(f => f.impact === 'High').length : 0)
     + (mythril.success ? mythril.issues.filter(i => i.severity === 'High').length : 0)
-    + (security.success ? security.findings.filter(f => f.severity === 'HIGH').length : 0);
+    + (security.success ? security.findings.filter(f => f.severity === 'HIGH').length : 0)
+    + (echidna.success ? (echidna.failed || 0) : 0);
   const totalMedium = (slither.success ? slither.findings.filter(f => f.impact === 'Medium').length : 0)
     + (mythril.success ? mythril.issues.filter(i => i.severity === 'Medium').length : 0)
     + (security.success ? security.findings.filter(f => f.severity === 'MEDIUM').length : 0);
@@ -419,7 +684,8 @@ function saveResult(address, balanceUsd, breakdown, slither, mythril, security) 
     contractName: slither.contractName || mythril.contractName || security.contractName || 'Onbekend',
     slither: { success: slither.success, high: slither.success ? slither.findings.filter(f => f.impact === 'High').length : 0, medium: slither.success ? slither.findings.filter(f => f.impact === 'Medium').length : 0, findings: slither.success ? slither.findings.filter(f => f.impact === 'High' || f.impact === 'Medium').map(f => ({ check: f.check, impact: f.impact, description: (f.description || '').substring(0, 200) })) : [] },
     mythril: { success: mythril.success, high: mythril.success ? mythril.issues.filter(i => i.severity === 'High').length : 0, medium: mythril.success ? mythril.issues.filter(i => i.severity === 'Medium').length : 0, issues: mythril.success ? mythril.issues.filter(i => i.severity === 'High' || i.severity === 'Medium').map(i => ({ title: i.title, severity: i.severity, swcId: i.swcId, function: i.function })) : [] },
-    security: { success: security.success, findings: security.success ? security.findings : [] }
+    security: { success: security.success, findings: security.success ? security.findings : [] },
+    echidna: { success: echidna.success, failed: echidna.failed || 0, passed: echidna.passed || 0, issues: echidna.success ? (echidna.issues || []).slice(0, 10) : [] }
   };
 
   results.unshift(newResult);
@@ -427,12 +693,175 @@ function saveResult(address, balanceUsd, breakdown, slither, mythril, security) 
 
   try { fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2)); } catch (e) { console.error('[WORKER] Save fout:', e.message); }
 
-  // Push naar Render dashboard
-  if (SCANNER_API_KEY) {
-    axios.post(`${RENDER_URL}/api/scanner/results`, { result: newResult }, {
-      headers: { 'x-api-key': SCANNER_API_KEY }, timeout: 10000
-    }).catch(e => console.error('[WORKER] Render push fout:', e.message));
+  // Push naar dashboards
+  const headers = { 'x-api-key': SCANNER_API_KEY };
+  if (SCANNER_API_KEY && RENDER_URL) {
+    axios.post(`${RENDER_URL}/api/scanner/results`, { result: newResult }, { headers, timeout: 10000 })
+      .catch(e => console.error('[WORKER] Render push fout:', e.message));
   }
+  // Lokaal dashboard: alleen verdachte/gevaarlijke contracten (high of medium findings)
+  const LOCAL_DASH = process.env.LOCAL_DASH || 'http://localhost:3099';
+  if (SCANNER_API_KEY && LOCAL_DASH) {
+    axios.post(`${LOCAL_DASH}/api/scanner/results`, { result: newResult }, { headers, timeout: 3000 })
+      .catch(() => {});
+  }
+}
+
+// === BUSINESS LOGIC AUDIT (Stap 8) ===
+// Gebruikt Claude om business logic bugs te vinden en genereert een Hardhat exploit om ze te verifiëren
+
+async function runBusinessLogicAudit(address, sourceCode, balanceUsd, breakdown) {
+  if (!CLAUDE_API_KEY) return null;
+
+  try {
+    // Stap 1: Stuur source naar Claude voor business logic analyse + exploit generatie
+    const trimmedSource = sourceCode.length > 30000 ? sourceCode.substring(0, 30000) + '\n// ... [TRUNCATED]' : sourceCode;
+
+    const tokenList = Object.entries(breakdown || {}).map(([k, v]) => `${k}: $${Math.round(v.usd || v.amount)}`).join(', ');
+
+    const prompt = `Je bent een elite smart contract security auditor die bug bounties doet. Analyseer dit BSC contract op BUSINESS LOGIC BUGS — fouten die niet door standaard tools (Slither/Mythril) gevonden worden.
+
+Contract: ${address}
+Balans: $${Math.round(balanceUsd)} (${tokenList})
+Chain: BSC (chainId 56)
+
+\`\`\`solidity
+${trimmedSource}
+\`\`\`
+
+Focus ALLEEN op:
+1. Rekenfouten (afrondingsbugs, verkeerde fee/reward berekening, overflow bij vermenigvuldiging)
+2. Flash loan aanvallen (spot price als oracle, manipuleerbare reserves)
+3. Logica fouten in claim/withdraw/stake (dubbel claimen, timing exploits, verkeerde bookkeeping)
+4. Access control gaps die NIET simpelweg "missing onlyOwner" zijn maar subtielere logica fouten
+5. Cross-function reentrancy of state inconsistencies
+6. Eerste depositor / donation attacks
+
+Als je een CONCRETE exploiteerbare bug vindt, genereer een Hardhat exploit script dat:
+- Draait op een BSC fork (ethers v6, Hardhat)
+- Impersonate het juiste adres als nodig (hre.network.provider.request({ method: "hardhat_impersonateAccount" }))
+- De exploit uitvoert en laat zien dat er winst gemaakt wordt
+- Console.log gebruikt om de stappen + balans veranderingen te tonen
+
+Antwoord in EXACT dit JSON format (geen markdown, puur JSON):
+{
+  "findings": ["korte beschrijving van elke finding"],
+  "exploitable": true/false,
+  "confidence": "HIGH"/"MEDIUM"/"LOW",
+  "exploit_description": "wat de exploit doet in 2-3 zinnen",
+  "exploit_code": "// volledig Hardhat script hier als exploitable=true, anders null"
+}
+
+Als er GEEN business logic bugs zijn, antwoord: {"findings": [], "exploitable": false, "confidence": "HIGH", "exploit_description": null, "exploit_code": null}
+
+BELANGRIJK: Alleen echte, exploiteerbare bugs. Geen theoretische risico's. Als je niet zeker bent, zet confidence op LOW.`;
+
+    const response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: [{ role: 'user', content: prompt }]
+    }, {
+      headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      timeout: 60000
+    });
+
+    const aiText = response.data.content[0].text;
+    let aiResult;
+    try {
+      // Probeer JSON te parsen (soms zit er markdown omheen)
+      const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.log('[WORKER-BL] Geen JSON in AI response');
+        return { findings: [], exploitConfirmed: false };
+      }
+      aiResult = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error('[WORKER-BL] JSON parse fout:', e.message);
+      return { findings: [], exploitConfirmed: false };
+    }
+
+    if (!aiResult.exploitable || !aiResult.exploit_code) {
+      return { findings: aiResult.findings || [], exploitConfirmed: false, confidence: aiResult.confidence };
+    }
+
+    // Stap 2: Voer exploit uit op Hardhat fork
+    console.log(`[WORKER-BL] Exploit gegenereerd (confidence: ${aiResult.confidence}), wordt getest...`);
+
+    const exploitDir = path.join(__dirname, 'tmp', `bl_exploit_${address}`);
+    fs.mkdirSync(exploitDir, { recursive: true });
+
+    const exploitFile = path.join(exploitDir, 'exploit.js');
+    fs.writeFileSync(exploitFile, aiResult.exploit_code);
+
+    let exploitOutput = '';
+    let exploitSuccess = false;
+    try {
+      exploitOutput = execSync(`npx hardhat run "${exploitFile}" --network hardhat`, {
+        cwd: __dirname,
+        timeout: 120000,
+        encoding: 'utf-8',
+        env: { ...process.env, TARGET_ADDRESS: address },
+      });
+      // Als het script succesvol draait zonder errors = exploit werkt
+      exploitSuccess = !exploitOutput.toLowerCase().includes('error') &&
+                       !exploitOutput.toLowerCase().includes('revert') &&
+                       exploitOutput.length > 10;
+      console.log(`[WORKER-BL] Exploit output (${exploitSuccess ? 'SUCCESS' : 'FAILED'}):\n${exploitOutput.substring(0, 500)}`);
+    } catch (e) {
+      exploitOutput = (e.stdout || '') + '\n' + (e.stderr || '');
+      console.log(`[WORKER-BL] Exploit gefaald: ${exploitOutput.substring(0, 300)}`);
+      exploitSuccess = false;
+    }
+
+    // Cleanup
+    setTimeout(() => { try { fs.rmSync(exploitDir, { recursive: true, force: true }); } catch(e) {} }, 10000);
+
+    return {
+      findings: aiResult.findings || [],
+      exploitConfirmed: exploitSuccess,
+      confidence: aiResult.confidence,
+      description: aiResult.exploit_description,
+      exploitOutput: exploitOutput.substring(0, 1000),
+      exploitCode: aiResult.exploit_code,
+    };
+
+  } catch (err) {
+    console.error('[WORKER-BL] Fout:', err.message);
+    return { findings: [], exploitConfirmed: false, error: err.message };
+  }
+}
+
+function formatBusinessLogicReport(address, result, balanceUsd) {
+  const conf = result.confidence === 'HIGH' ? '🔴' : result.confidence === 'MEDIUM' ? '🟡' : '⚪';
+
+  let msg = `🧠💀 *BUSINESS LOGIC EXPLOIT BEVESTIGD*\n\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `📋 *Contract:* \`${address}\`\n`;
+  msg += `💰 *Balans:* $${Math.round(balanceUsd).toLocaleString()}\n`;
+  msg += `${conf} *Confidence:* ${result.confidence}\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  msg += `📝 *Exploit:*\n${result.description || 'Geen beschrijving'}\n\n`;
+
+  if (result.findings && result.findings.length > 0) {
+    msg += `🔍 *Findings:*\n`;
+    for (const f of result.findings.slice(0, 5)) {
+      msg += `• ${f}\n`;
+    }
+    msg += '\n';
+  }
+
+  if (result.exploitOutput) {
+    const cleanOutput = result.exploitOutput.substring(0, 400).replace(/[`]/g, "'");
+    msg += `📟 *Test Output:*\n\`\`\`\n${cleanOutput}\n\`\`\`\n\n`;
+  }
+
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `⚠️ *Bug Bounty Target*\n`;
+  msg += `🔗 [BSCScan](https://bscscan.com/address/${address})\n`;
+  msg += `📄 [Source Code](https://bscscan.com/address/${address}#code)`;
+
+  return msg;
 }
 
 // === MAIN: ontvang opdracht van parent process ===
@@ -455,6 +884,11 @@ process.on('message', async (msg) => {
     const securityResult = await runSecurityCheck(address);
     await safeSend(formatSecurityReport(address, securityResult));
 
+    // 3.5 Foundry on-chain scan
+    const foundryResult = await runFoundryScan(address);
+    const foundryReport = formatFoundryReport(address, foundryResult);
+    if (foundryReport) await safeSend(foundryReport);
+
     // 4. AI (optioneel)
     if (CLAUDE_API_KEY) {
       await safeSend(`🤖 *AI analyse...*\n\`${address}\``);
@@ -465,8 +899,88 @@ process.on('message', async (msg) => {
       if (aiText) await safeSend(`🤖 *AI Deep Analyse*\n━━━━━━━━━━━━━━━━━━━━\n\`${address}\`\n━━━━━━━━━━━━━━━━━━━━\n\n${aiText}`);
     }
 
-    // 5. Opslaan
-    saveResult(address, totalUsd, breakdown, slitherResult, mythrilResult, securityResult);
+    // 5. Echidna fuzzing (als Docker beschikbaar is)
+    let echidnaResult = { success: false, error: 'overgeslagen' };
+    try {
+      execSync('docker info', { timeout: 10000, stdio: 'ignore', env: DOCKER_ENV });
+      await safeSend(`🦔 *Echidna fuzzing...*\n\`${address}\`\n⏳ 1-3 min...`);
+      echidnaResult = await runEchidna(address);
+      await safeSend(formatEchidnaReport(address, echidnaResult));
+      // Push echidna resultaten naar dashboard
+      if (echidnaResult.success && SCANNER_API_KEY && RENDER_URL) {
+        const echidnaPush = { address, contractName: echidnaResult.contractName, time: new Date().toISOString(), passed: echidnaResult.passed, failed: echidnaResult.failed, issues: (echidnaResult.issues || []).slice(0, 10) };
+        axios.post(`${RENDER_URL}/api/scanner/echidna`, { result: echidnaPush }, { headers: { 'x-api-key': SCANNER_API_KEY }, timeout: 10000 })
+          .catch(e => console.error('[WORKER] Echidna dashboard push fout:', e.message));
+      }
+    } catch (e) {
+      console.log('[WORKER] Docker niet beschikbaar, Echidna overgeslagen');
+    }
+
+    // 6. Opslaan
+    saveResult(address, totalUsd, breakdown, slitherResult, mythrilResult, securityResult, echidnaResult);
+
+    // 7. Exploit test als er kritieke findings zijn
+    const highFindings = {
+      slither: slitherResult.success ? slitherResult.findings.filter(f => f.impact === 'High' || f.impact === 'Medium') : [],
+      mythril: mythrilResult.success ? mythrilResult.issues.filter(i => i.severity === 'High' || i.severity === 'Medium') : [],
+      security: securityResult.success ? securityResult.findings.filter(f => f.severity === 'HIGH' || f.severity === 'MEDIUM') : [],
+    };
+    const totalCritical = highFindings.slither.filter(f => f.impact === 'High').length
+      + highFindings.mythril.filter(i => i.severity === 'High').length
+      + highFindings.security.filter(f => f.severity === 'HIGH').length;
+
+    if (totalCritical > 0) {
+      console.log(`[WORKER] ${totalCritical} kritieke findings — start exploit test...`);
+      await safeSend(`⚡ *Exploit test gestart...*\n\`${address}\`\n🔴 ${totalCritical} kritieke findings gevonden\n⏳ Wordt getest op lokale Hardhat fork...`);
+      try {
+        // Schrijf findings naar temp bestand zodat exploit-tester ze kan lezen
+        const findingsFile = path.join(__dirname, 'tmp', `findings_${address}.json`);
+        fs.mkdirSync(path.join(__dirname, 'tmp'), { recursive: true });
+        fs.writeFileSync(findingsFile, JSON.stringify(highFindings));
+
+        const { execSync } = require('child_process');
+        const output = execSync(`npx hardhat run exploit-tester.js --network hardhat`, {
+          cwd: path.join(__dirname),
+          timeout: 180000,
+          encoding: 'utf-8',
+          env: { ...process.env, EXPLOIT_ADDRESS: address, EXPLOIT_FINDINGS: findingsFile },
+        });
+        console.log(output);
+
+        // Cleanup
+        try { fs.unlinkSync(findingsFile); } catch (e) {}
+      } catch (e) {
+        console.error(`[WORKER] Exploit test fout: ${(e.stdout || e.message || '').substring(0, 300)}`);
+      }
+    }
+
+    // 8. Business Logic Audit (AI + Anvil exploit verificatie)
+    // Alleen voor contracten >$10K met verified source, zonder high-severity findings (die al door stap 7 getest worden)
+    const hasVerifiedSource = securityResult.sourceCode && securityResult.sourceCode.length > 100;
+    const qualifiesForLogicAudit = hasVerifiedSource && totalUsd >= 10000 && totalCritical === 0;
+
+    if (qualifiesForLogicAudit && CLAUDE_API_KEY) {
+      console.log(`[WORKER] Business logic audit gestart: ${address} ($${totalUsd})`);
+      await safeSend(`🧠 *Business Logic Audit...*\n\`${address}\`\n💰 $${Math.round(totalUsd).toLocaleString()}\n⏳ AI analyseert business logic + genereert exploit...`);
+      try {
+        const logicResult = await runBusinessLogicAudit(address, securityResult.sourceCode, totalUsd, breakdown);
+        if (logicResult && logicResult.exploitConfirmed) {
+          await safeSend(formatBusinessLogicReport(address, logicResult, totalUsd));
+          // Push naar dashboard
+          if (SCANNER_API_KEY && RENDER_URL) {
+            axios.post(`${RENDER_URL}/api/scanner/results`, {
+              result: { address, businessLogic: logicResult, balanceUsd: totalUsd, time: new Date().toISOString() }
+            }, { headers: { 'x-api-key': SCANNER_API_KEY }, timeout: 10000 }).catch(() => {});
+          }
+        } else if (logicResult && logicResult.findings && logicResult.findings.length > 0) {
+          await safeSend(`🧠 *Business Logic Audit*\n━━━━━━━━━━━━━━━━━━━━\n\`${address}\`\n🟡 Mogelijke bugs gevonden maar exploit niet bevestigd\n━━━━━━━━━━━━━━━━━━━━\n\n${logicResult.findings.map(f => `• ${f}`).join('\n')}`);
+        } else {
+          console.log(`[WORKER] Business logic audit: geen exploits gevonden voor ${address}`);
+        }
+      } catch (e) {
+        console.error(`[WORKER] Business logic audit fout: ${e.message}`);
+      }
+    }
 
     console.log(`[WORKER] Analyse klaar: ${address}`);
     process.send({ done: true, address });
