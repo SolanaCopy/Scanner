@@ -10,6 +10,43 @@ const SLITHER_PATH = 'C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scr
 const SOLC_PATH = 'C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts/solc.exe';
 const MYTHRIL_PATH = 'C:/Users/moham/AppData/Local/Programs/Python/Python311/Scripts/myth.exe';
 
+// === BSCSCAN RATE LIMIT WRAPPER ===
+let lastBscScanCall = 0;
+async function bscScanGet(url) {
+  // Min 250ms tussen calls (BscScan free = 5/sec)
+  const now = Date.now();
+  const wait = Math.max(0, 250 - (now - lastBscScanCall));
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastBscScanCall = Date.now();
+
+  const backoffs = [1000, 2000, 4000, 8000, 15000, 30000];
+  const maxAttempts = backoffs.length + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await axios.get(url, { timeout: 15000 });
+      const rl = res.data.message === 'NOTOK' && typeof res.data.result === 'string' && res.data.result.toLowerCase().includes('rate limit');
+      if (rl) {
+        if (attempt < maxAttempts) {
+          const delay = backoffs[attempt - 1];
+          console.log(`[BSCSCAN] Rate limit — retry ${attempt}/${maxAttempts} in ${delay}ms`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        console.log(`[BSCSCAN] ❌ Rate limit uitgeput na ${maxAttempts} pogingen`);
+        res._rateLimited = true;
+      }
+      return res;
+    } catch (e) {
+      if (attempt < maxAttempts) {
+        const delay = backoffs[attempt - 1] || 1000;
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 // === CONFIG ===
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -50,6 +87,7 @@ const STABLECOINS = [
   { name: 'USDT', address: '0x55d398326f99059fF775485246999027B3197955', decimals: 18 },
   { name: 'USDC', address: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', decimals: 18 },
   { name: 'BUSD', address: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56', decimals: 18 },
+  { name: 'WBNB', address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', decimals: 18, priceMultiplier: true },
 ];
 
 const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
@@ -107,6 +145,7 @@ const SKIP_ADDRESSES = new Set([
   '0x0000000000000000000000000000000000002001'.toLowerCase(), // StakeHub
   // === EXCHANGE TREASURIES ===
   '0xcEF2dD45Da08b37fB1c2f441d33c2eBb424866A4'.toLowerCase(), // ApolloxExchangeTreasury (uit scan)
+  '0x1b6F2d3844C6ae7D56ceb3C3643b9060ba28FEb0'.toLowerCase(), // ApolloX Router (uit scan)
   '0xad2EAE16157002a97E11b4201D111e6cd4C977ca'.toLowerCase(), // Groot contract (uit scan)
   '0x0B54637d1F9Ed1F86Dd349dF47395dB0A2a2Ed3F'.toLowerCase(), // Groot contract (uit scan)
   '0xcFe66D6c615500Fb0E567D9BaBdC6E3cDcd23634'.toLowerCase(), // Groot contract (uit scan)
@@ -124,15 +163,16 @@ try {
 } catch (e) {}
 
 // === INIT (meerdere RPCs voor load balancing) ===
+// Gecureerd 2026-06-02: bsc.meowrpc.com verwijderd (429 rate-limit), drpc+blastapi toegevoegd (getest 200+block).
 const BSC_RPCS = [
   BSC_RPC,                               // bsc-dataseed1.binance.org (hoofd)
+  'https://bsc-rpc.publicnode.com',      // PublicNode (50ms, snel)
   'https://bsc-dataseed2.binance.org',
   'https://bsc-dataseed3.binance.org',
   'https://bsc-dataseed4.binance.org',
-  'https://bsc-rpc.publicnode.com',      // PublicNode
-  'https://bsc.meowrpc.com',            // MeowRPC gratis
+  'https://bsc.drpc.org',                // dRPC
+  'https://bsc-mainnet.public.blastapi.io', // Blast API
   'https://bsc-dataseed1.defibit.io',
-  'https://bsc-dataseed2.defibit.io',
 ];
 const providers = BSC_RPCS.map(url => new ethers.JsonRpcProvider(url, undefined, { batchMaxCount: 1 }));
 let providerIndex = 0;
@@ -168,10 +208,11 @@ let consecutiveErrors = 0;
 let backwardDone = false;
 let transferHits = 0; // Track B: grote stablecoin transfers
 
-// Worker tracking (max 2 gelijktijdig)
-const MAX_WORKERS = 2;
+// Worker tracking (1 tegelijk — voorkomt door-elkaar meldingen in Telegram)
+const MAX_WORKERS = 1;
 const activeWorkers = new Set();
 const analyzingAddresses = new Set();
+const workerQueue = []; // Priority queue — gesorteerd op urgentie
 let currentScanBlock = 0; // global zodat saveState altijd werkt
 
 // Lijst van gevonden contracten (max 50 bijhouden)
@@ -202,6 +243,57 @@ setInterval(() => {
 // Lijst van alerts (matches)
 const recentAlerts = [];
 const MAX_ALERTS = 20;
+
+// === ALERT DEDUPLICATION ===
+// Voorkomt dat hetzelfde contract meerdere keren een alert geeft binnen cooldown
+const ALERT_DEDUPE_FILE = path.join(__dirname, 'alerted_addresses.json');
+const ALERT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000; // 7 dagen
+let alertedMap = new Map(); // address → timestamp ms
+
+// Laad eerdere alerts van disk
+try {
+  if (fs.existsSync(ALERT_DEDUPE_FILE)) {
+    const data = JSON.parse(fs.readFileSync(ALERT_DEDUPE_FILE, 'utf-8'));
+    const now = Date.now();
+    for (const [addr, ts] of Object.entries(data)) {
+      // Skip oude entries (>cooldown)
+      if (now - ts < ALERT_COOLDOWN_MS) {
+        alertedMap.set(addr.toLowerCase(), ts);
+      }
+    }
+    console.log(`[DEDUPE] ${alertedMap.size} eerdere alerts geladen (binnen 7 dagen cooldown)`);
+  }
+} catch (e) { console.log('[DEDUPE] Geen eerdere alerts file'); }
+
+// Periodiek opslaan en oude entries opschonen (elke 5 min)
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const obj = {};
+    for (const [addr, ts] of alertedMap.entries()) {
+      if (now - ts < ALERT_COOLDOWN_MS) {
+        obj[addr] = ts;
+      } else {
+        alertedMap.delete(addr);
+      }
+    }
+    fs.writeFileSync(ALERT_DEDUPE_FILE, JSON.stringify(obj));
+  } catch (e) {}
+}, 5 * 60 * 1000);
+
+// Helper: is dit adres al gealerted binnen cooldown?
+function isRecentlyAlerted(address) {
+  const lower = address.toLowerCase();
+  const ts = alertedMap.get(lower);
+  if (!ts) return false;
+  const ageMs = Date.now() - ts;
+  return ageMs < ALERT_COOLDOWN_MS;
+}
+
+// Markeer adres als gealerted
+function markAlerted(address) {
+  alertedMap.set(address.toLowerCase(), Date.now());
+}
 
 // === STATE SAVE/RESUME ===
 const STATE_FILE = path.join(__dirname, 'scanner_state.json');
@@ -391,14 +483,15 @@ async function getTotalBalance(address) {
     }
   } catch (err) {}
 
-  // Stablecoin balances
+  // Stablecoin + token balances
   for (const sc of stablecoinContracts) {
     try {
       const bal = await sc.contract.balanceOf(address);
       const amount = parseFloat(ethers.formatUnits(bal, sc.decimals));
       if (amount > 0) {
-        totalUsd += amount; // Stablecoins = ~$1
-        breakdown[sc.name] = { amount, usd: amount };
+        const usd = sc.priceMultiplier ? amount * bnbPriceUsd : amount; // WBNB = BNB prijs, stablecoins = $1
+        totalUsd += usd;
+        breakdown[sc.name] = { amount, usd };
       }
     } catch (err) {}
   }
@@ -427,7 +520,7 @@ async function runSlither(address) {
   try {
     // Source code ophalen van BSCScan
     const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${address}&apikey=${BSCSCAN_KEY}`;
-    const res = await axios.get(url);
+    const res = await bscScanGet(url);
 
     if (res.data.status !== '1' || !res.data.result[0].SourceCode) {
       return { success: false, error: 'Source code niet beschikbaar' };
@@ -478,9 +571,9 @@ async function runSlither(address) {
     // Slither draaien
     let output = '';
     try {
-      output = execSync(`"${SLITHER_PATH}" "${tmpDir}" --json -`, {
+      output = execSync(`"${SLITHER_PATH}" . --json -`, {
         timeout: 120000,
-        encoding: 'utf-8',
+        encoding: 'utf-8', cwd: tmpDir,
         env: { ...process.env, PATH: process.env.PATH + ';C:/Users/moham/AppData/Local/Python/pythoncore-3.14-64/Scripts' }
       });
     } catch (e) {
@@ -575,7 +668,7 @@ async function runMythril(address) {
   try {
     // Source code ophalen van BSCScan
     const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${address}&apikey=${BSCSCAN_KEY}`;
-    const res = await axios.get(url);
+    const res = await bscScanGet(url);
 
     if (res.data.status !== '1' || !res.data.result[0].SourceCode) {
       return { success: false, error: 'Source code niet beschikbaar' };
@@ -823,13 +916,62 @@ ${riskLevel}
 }
 
 // === CHECK OF CONTRACT VERIFIED IS ===
+// Cache voor isVerified — 24u TTL voor positive, 1u voor negative
+const verifyCache = new Map(); // address(lc) -> { verified: bool, ts: number }
+const VERIFY_TTL_OK = 24 * 60 * 60 * 1000;
+const VERIFY_TTL_NEG = 60 * 60 * 1000;
+
+// Retry-queue voor contracten die rate-limited raakten tijdens verify
+const verifyRetryQueue = []; // { address, totalUsd, breakdown, source, attempts, nextTry }
+const VERIFY_MAX_ATTEMPTS = 5;
+
+function scheduleVerifyRetry(address, totalUsd, breakdown, source, attempts = 0) {
+  if (attempts >= VERIFY_MAX_ATTEMPTS) {
+    console.log(`[RATE-LIMITED] ${address} - ${attempts} retries uitgeput, opgegeven`);
+    return;
+  }
+  if (verifyRetryQueue.some(q => q.address.toLowerCase() === address.toLowerCase())) return;
+  const delay = Math.min(60000 * Math.pow(2, attempts), 15 * 60 * 1000); // 1min, 2min, 4min, 8min, 15min
+  verifyRetryQueue.push({ address, totalUsd, breakdown, source, attempts, nextTry: Date.now() + delay });
+}
+
+async function processVerifyRetryQueue() {
+  const now = Date.now();
+  const ready = verifyRetryQueue.filter(q => q.nextTry <= now);
+  for (const item of ready) {
+    const idx = verifyRetryQueue.indexOf(item);
+    if (idx >= 0) verifyRetryQueue.splice(idx, 1);
+    const v = await isVerified(item.address);
+    if (v === true) {
+      console.log(`[VERIFY-RETRY] ${item.address} - nu verified, door naar alert`);
+      verifiedContracts++;
+      await sendAlert(item.address, item.totalUsd, item.breakdown, true);
+    } else if (v === false) {
+      console.log(`[VERIFY-RETRY] ${item.address} - unverified, skip`);
+    } else {
+      // opnieuw rate-limited
+      scheduleVerifyRetry(item.address, item.totalUsd, item.breakdown, item.source, item.attempts + 1);
+    }
+  }
+}
+setInterval(processVerifyRetryQueue, 30 * 1000);
+
 async function isVerified(address) {
+  const key = address.toLowerCase();
+  const cached = verifyCache.get(key);
+  if (cached) {
+    const ttl = cached.verified ? VERIFY_TTL_OK : VERIFY_TTL_NEG;
+    if (Date.now() - cached.ts < ttl) return cached.verified;
+  }
   try {
     const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getabi&address=${address}&apikey=${BSCSCAN_KEY}`;
-    const res = await axios.get(url);
-    return res.data.status === '1';
+    const res = await bscScanGet(url);
+    if (res._rateLimited) return null; // sentinel: rate-limited, niet cachen
+    const verified = res.data.status === '1';
+    verifyCache.set(key, { verified, ts: Date.now() });
+    return verified;
   } catch (err) {
-    return false;
+    return null;
   }
 }
 
@@ -872,6 +1014,101 @@ bot.onText(/\/lijst/, async (msg) => {
 bot.onText(/\/alerts/, async (msg) => {
   if (msg.chat.id.toString() !== CHAT_ID) return;
   await sendAlertList();
+});
+
+bot.onText(/\/stats/, async (msg) => {
+  if (msg.chat.id.toString() !== CHAT_ID) return;
+  try {
+    const HISTORY_FILE = path.join(__dirname, 'findings_history.jsonl');
+    if (!fs.existsSync(HISTORY_FILE)) {
+      return await bot.sendMessage(CHAT_ID, '📊 *Stats*\n\nNog geen findings history. Wacht tot eerste alerts binnenkomen.', { parse_mode: 'Markdown' });
+    }
+    const lines = fs.readFileSync(HISTORY_FILE, 'utf-8').split('\n').filter(Boolean);
+    const periods = [
+      { label: '24u', days: 1 },
+      { label: '7d', days: 7 },
+      { label: '30d', days: 30 },
+      { label: 'totaal', days: 9999 },
+    ];
+
+    let report = `📊 *Scanner Accuracy Stats*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    for (const p of periods) {
+      const cutoff = Date.now() - (p.days * 24 * 60 * 60 * 1000);
+      const entries = [];
+      for (const line of lines) {
+        try {
+          const e = JSON.parse(line);
+          if (e.ts >= cutoff) entries.push(e);
+        } catch (err) {}
+      }
+      if (entries.length === 0) continue;
+
+      const confirmed = entries.filter(e => e.verifyVerdict === 'CONFIRMED').length;
+      const falsePos = entries.filter(e => e.verifyVerdict === 'FALSE_POSITIVE').length;
+      const uncertain = entries.filter(e => e.verifyVerdict === 'UNCERTAIN').length;
+      const accuracy = entries.length > 0 ? Math.round((confirmed / entries.length) * 100) : 0;
+
+      report += `*${p.label}* — ${entries.length} findings\n`;
+      report += `  ✅ Confirmed: ${confirmed}\n`;
+      report += `  ❌ False Pos: ${falsePos}\n`;
+      report += `  ⚠️ Uncertain: ${uncertain}\n`;
+      report += `  📈 Accuracy: ${accuracy}%\n\n`;
+    }
+
+    // Top 5 categorieën laatste 30 dagen
+    const cutoff30 = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const entries30 = [];
+    for (const line of lines) {
+      try { const e = JSON.parse(line); if (e.ts >= cutoff30) entries30.push(e); } catch (err) {}
+    }
+    const byCategory = {};
+    for (const e of entries30) {
+      const key = e.agent || 'unknown';
+      if (!byCategory[key]) byCategory[key] = { total: 0, confirmed: 0 };
+      byCategory[key].total++;
+      if (e.verifyVerdict === 'CONFIRMED') byCategory[key].confirmed++;
+    }
+    const sorted = Object.entries(byCategory)
+      .sort((a, b) => b[1].total - a[1].total)
+      .slice(0, 5);
+
+    if (sorted.length > 0) {
+      report += `*Top 5 Categorieën (30d)*\n`;
+      for (const [cat, stats] of sorted) {
+        const acc = stats.total > 0 ? Math.round((stats.confirmed / stats.total) * 100) : 0;
+        report += `  • ${cat}: ${stats.confirmed}/${stats.total} (${acc}%)\n`;
+      }
+    }
+
+    // Anvil stats
+    const allEntries = lines.map(l => { try { return JSON.parse(l); } catch(e) { return null; } }).filter(Boolean);
+    const anvilProven = allEntries.filter(e => e.anvilResult === 'PROVEN').length;
+    const anvilRejected = allEntries.filter(e => e.anvilResult === 'REJECTED').length;
+    report += `\n*Anvil Fork Bewijs*\n`;
+    report += `  ⚡✅ Proven: ${anvilProven}\n`;
+    report += `  ⚡❌ Rejected: ${anvilRejected}\n`;
+    report += `  📊 Hit rate: ${allEntries.length > 0 ? Math.round(anvilProven / (anvilProven + anvilRejected) * 100) : 0}%\n`;
+
+    // Geleerde FP patronen
+    const fnStats = {};
+    for (const f of allEntries) {
+      const fn = f.function || '?';
+      if (!fnStats[fn]) fnStats[fn] = { total: 0, proven: 0, rejected: 0 };
+      fnStats[fn].total++;
+      if (f.anvilResult === 'PROVEN') fnStats[fn].proven++;
+      if (f.anvilResult === 'REJECTED') fnStats[fn].rejected++;
+    }
+    const fpPatterns = Object.entries(fnStats).filter(([fn, s]) => s.total >= 2 && s.proven === 0);
+    if (fpPatterns.length > 0) {
+      report += `\n*Geleerde FP Patronen (${fpPatterns.length})*\n`;
+      for (const [fn, s] of fpPatterns) report += `  ❌ ${fn} (${s.total}x rejected)\n`;
+    }
+
+    await bot.sendMessage(CHAT_ID, report, { parse_mode: 'Markdown' });
+  } catch (e) {
+    await bot.sendMessage(CHAT_ID, `❌ Stats fout: ${e.message}`);
+  }
 });
 
 bot.onText(/\/scan (.+)/, async (msg, match) => {
@@ -1004,6 +1241,24 @@ bot.onText(/\/fullscan/, async (msg) => {
   await bot.sendMessage(CHAT_ID, `✅ *Full Scan Voltooid!*\n\`${address}\``, { parse_mode: 'Markdown' });
 });
 
+bot.onText(/\/audit/, async (msg) => {
+  if (msg.chat.id.toString() !== CHAT_ID) return;
+  const addrMatch = msg.text.match(/0x[a-fA-F0-9]{40}/);
+  if (!addrMatch) {
+    await bot.sendMessage(CHAT_ID, '❌ Geen geldig adres.\n\nGebruik: `/audit 0x1234...`\nDraait volledige pipeline: Slither → Pashov (Sonnet→Opus) → Anvil', { parse_mode: 'Markdown' });
+    return;
+  }
+  const address = addrMatch[0];
+  await bot.sendMessage(CHAT_ID, `🏛️ *Pashov Audit gestart*\n\`${address}\`\n\n⏳ Balance ophalen + volledige pipeline starten...`, { parse_mode: 'Markdown' });
+  try {
+    const { totalUsd, breakdown } = await getTotalBalance(address);
+    await bot.sendMessage(CHAT_ID, `💰 Balance: $${Math.round(totalUsd).toLocaleString()}\n🔄 Worker gestart — resultaten komen vanzelf in de groep.`, { parse_mode: 'Markdown' });
+    startWorker(address, totalUsd, breakdown);
+  } catch (err) {
+    await bot.sendMessage(CHAT_ID, `❌ Fout: ${err.message}`, { parse_mode: 'Markdown' });
+  }
+});
+
 bot.onText(/\/help/, async (msg) => {
   if (msg.chat.id.toString() !== CHAT_ID) return;
   await bot.sendMessage(CHAT_ID, `📖 *BSC Scanner v4 - Commando's*
@@ -1015,12 +1270,14 @@ bot.onText(/\/help/, async (msg) => {
 /status - Live status bekijken
 /lijst - Laatste gevonden contracten
 /alerts - Lijst van matches (alerts)
+/stats - Accuracy stats van alle findings
 
 *Analyse:*
 /check 0x... - Slither analyse
 /mythril 0x... - Mythril deep analyse
 /security 0x... - Rugpull & exploit check
 /fullscan 0x... - Alles in 1 (4 stappen)
+/audit 0x... - Pashov pipeline (Sonnet→Opus→Anvil)
 
 *Overig:*
 /help - Dit menu
@@ -1065,6 +1322,8 @@ async function startHistoryScan(blocksBack, label) {
 
         for (const tx of contractTxs) {
           try {
+            // Skip contracten deployed door bekende factories
+            if (SKIP_DEPLOYERS.has(tx.from.toLowerCase())) continue;
             const receipt = await provider.getTransactionReceipt(tx.hash);
             if (!receipt || !receipt.contractAddress) continue;
 
@@ -1120,29 +1379,12 @@ async function startHistoryScan(blocksBack, label) {
     scannedInScan++;
     blocksScanned++;
 
-    // Progress update elke 60 seconden
+    // Progress alleen naar console (niet meer naar Telegram)
     if (Date.now() - lastProgressUpdate > 60000) {
       const pct = ((scannedInScan / totalBlocks) * 100).toFixed(1);
-      const elapsed = ((Date.now() - scanStart) / 60000).toFixed(1);
       const speed = (scannedInScan / ((Date.now() - scanStart) / 60000)).toFixed(0);
-      const remaining = ((totalBlocks - scannedInScan) / (scannedInScan / ((Date.now() - scanStart) / 60000))).toFixed(1);
-
       historyScanProgress = `${pct}%`;
-
-      await bot.sendMessage(CHAT_ID, `⏳ *History Scan Voortgang*
-
-━━━━━━━━━━━━━━━━━━━━
-📊 *${pct}%* voltooid
-📦 ${scannedInScan.toLocaleString()} / ${totalBlocks.toLocaleString()} blocks
-📋 ${foundInScan} contracten gevonden
-💰 ${balanceInScan} met $10k+ balance
-🚨 ${alertsInScan} matches
-
-⚡ Snelheid: ${speed} blocks/min
-⏱️ Verstreken: ${elapsed} min
-⏱️ Geschat resterend: ~${remaining} min
-━━━━━━━━━━━━━━━━━━━━`, { parse_mode: 'Markdown' });
-
+      console.log(`[HISTORY] ${pct}% — ${scannedInScan}/${totalBlocks} blocks, ${foundInScan} contracten, ${alertsInScan} matches, ${speed} blocks/min`);
       lastProgressUpdate = Date.now();
     }
 
@@ -1164,8 +1406,8 @@ async function startHistoryScan(blocksBack, label) {
 📊 *Resultaten:*
 📦 Blocks gescand: *${scannedInScan.toLocaleString()}*
 📋 Contracten gevonden: *${foundInScan}*
-💰 Met $10k+ balance: *${balanceInScan}*
-🚨 Matches (verified + $10k+): *${alertsInScan}*
+💰 Met $${(MIN_BALANCE_USD/1000).toFixed(0)}k+ balance: *${balanceInScan}*
+🚨 Matches (verified + $${(MIN_BALANCE_USD/1000).toFixed(0)}k+): *${alertsInScan}*
 
 ${alertsInScan > 0 ? '👆 Bekijk /alerts voor alle matches' : '😔 Geen matches gevonden in deze periode'}
 ━━━━━━━━━━━━━━━━━━━━
@@ -1177,7 +1419,7 @@ ${alertsInScan > 0 ? '👆 Bekijk /alerts voor alle matches' : '😔 Geen matche
 async function runSecurityCheck(address) {
   try {
     const url = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${address}&apikey=${BSCSCAN_KEY}`;
-    const res = await axios.get(url);
+    const res = await bscScanGet(url);
     if (res.data.status !== '1' || !res.data.result[0].SourceCode) {
       return { success: false, error: 'Source niet beschikbaar' };
     }
@@ -1569,12 +1811,144 @@ _Powered by Claude AI_
 ⏰ ${new Date().toLocaleString('nl-NL')}`;
 }
 
+// === PRE-FLIGHT CHECK: on-chain state verificatie vóór analyse ===
+async function preFlightCheck(contractAddress, originalUsd) {
+  try {
+    // 1. Balance opnieuw checken
+    const { totalUsd: currentUsd } = await getTotalBalance(contractAddress);
+    if (currentUsd < 100) {
+      console.log(`[PRE-FLIGHT] ❌ ${contractAddress} — balance gedaald naar $${currentUsd.toFixed(0)}, skip`);
+      return { pass: false, reason: 'balance_empty', currentUsd };
+    }
+
+    // 2. Grote daling detecteren (>80% weg = waarschijnlijk al gerugged)
+    if (originalUsd > 0 && currentUsd < originalUsd * 0.2) {
+      console.log(`[PRE-FLIGHT] ⚠️ ${contractAddress} — balance gedaald van $${originalUsd.toFixed(0)} naar $${currentUsd.toFixed(0)} (${Math.round((1 - currentUsd/originalUsd) * 100)}% weg), skip`);
+      return { pass: false, reason: 'balance_dropped', currentUsd };
+    }
+
+    // 3. Paused state checken via common paused() selector
+    try {
+      const code = await provider.getCode(contractAddress);
+      // 0x5c975abb = paused() selector
+      if (code.includes('5c975abb')) {
+        const pausedData = await provider.call({ to: contractAddress, data: '0x5c975abb' });
+        const isPaused = pausedData && pausedData !== '0x' && BigInt(pausedData) === 1n;
+        if (isPaused) {
+          console.log(`[PRE-FLIGHT] ⏸️ ${contractAddress} — contract is gepauzeerd`);
+          // Gepauzeerd = niet per se skip, maar wel lagere prioriteit
+          return { pass: true, currentUsd, paused: true };
+        }
+      }
+    } catch (e) { /* geen paused() functie, normaal */ }
+
+    return { pass: true, currentUsd, paused: false };
+  } catch (e) {
+    console.error(`[PRE-FLIGHT] Fout: ${e.message}`);
+    return { pass: true, currentUsd: originalUsd, paused: false }; // bij twijfel: doorgaan
+  }
+}
+
+// === PRIORITY SCORE: hogere score = eerder verwerkt ===
+function calcPriority(totalUsd, detectedAt) {
+  let score = 0;
+
+  // Factor 1: Balance — meer geld = urgenter (log schaal)
+  if (totalUsd >= 100000) score += 50;
+  else if (totalUsd >= 50000) score += 40;
+  else if (totalUsd >= 10000) score += 30;
+  else if (totalUsd >= 5000) score += 20;
+  else score += 10;
+
+  // Factor 2: Leeftijd — jonger = urgenter
+  const ageMinutes = (Date.now() - (detectedAt || Date.now())) / 60000;
+  if (ageMinutes < 5) score += 40;        // net gedeployed
+  else if (ageMinutes < 30) score += 30;   // recent
+  else if (ageMinutes < 120) score += 20;  // paar uur
+  else if (ageMinutes < 1440) score += 10; // vandaag
+  // ouder dan 1 dag: +0
+
+  return score;
+}
+
+// === WORKER STARTEN (met queue processing) ===
+function startWorker(contractAddress, totalUsd, breakdown) {
+  analyzingAddresses.add(contractAddress.toLowerCase());
+  const worker = fork(path.join(__dirname, 'analyze-worker.js'), { windowsHide: true });
+  activeWorkers.add(worker);
+  console.log(`[WORKER] Analyse worker gestart voor ${contractAddress} (${activeWorkers.size}/${MAX_WORKERS} actief, ${workerQueue.length} in queue)`);
+
+  worker.send({ address: contractAddress, totalUsd, breakdown });
+
+  function onWorkerDone() {
+    activeWorkers.delete(worker);
+    analyzingAddresses.delete(contractAddress.toLowerCase());
+    // Volgende uit queue starten — pak hoogste prioriteit
+    processNextFromQueue();
+  }
+
+  worker.on('message', (msg) => {
+    if (msg.done) {
+      console.log(`[WORKER] Analyse klaar: ${msg.address}${msg.error ? ' (fout: ' + msg.error + ')' : ''}`);
+      onWorkerDone();
+    }
+  });
+
+  worker.on('error', (err) => {
+    console.error(`[WORKER] Worker error:`, err.message);
+    onWorkerDone();
+  });
+
+  worker.on('exit', (code) => {
+    if (code !== 0) console.error(`[WORKER] Worker crashed met code ${code}`);
+    // Alleen opruimen als niet al via message/error gedaan
+    if (activeWorkers.has(worker)) onWorkerDone();
+  });
+}
+
+// === QUEUE VERWERKEN: pre-flight check + hoogste prioriteit eerst ===
+async function processNextFromQueue() {
+  if (workerQueue.length === 0 || activeWorkers.size >= MAX_WORKERS) return;
+
+  // Sorteer queue op prioriteit (hoogste eerst)
+  workerQueue.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+  // Loop door queue totdat we een contract vinden dat pre-flight haalt
+  while (workerQueue.length > 0 && activeWorkers.size < MAX_WORKERS) {
+    const next = workerQueue.shift();
+    console.log(`[QUEUE] Pre-flight check: ${next.address} (prio ${next.priority || 0}, ${workerQueue.length} resterend)`);
+
+    const check = await preFlightCheck(next.address, next.totalUsd);
+    if (!check.pass) {
+      console.log(`[QUEUE] ❌ ${next.address} gefaald: ${check.reason} ($${(check.currentUsd || 0).toFixed(0)} over)`);
+      continue; // probeer volgende
+    }
+
+    // Update balance als die veranderd is
+    if (check.currentUsd && Math.abs(check.currentUsd - next.totalUsd) > 100) {
+      console.log(`[QUEUE] Balance update: $${next.totalUsd.toFixed(0)} → $${check.currentUsd.toFixed(0)}`);
+      next.totalUsd = check.currentUsd;
+    }
+
+    console.log(`[QUEUE] ✅ Volgende uit wachtrij: ${next.address} ($${next.totalUsd.toFixed(0)}, prio ${next.priority || 0})`);
+    startWorker(next.address, next.totalUsd, next.breakdown);
+    return;
+  }
+}
+
 // === TELEGRAM ALERT STUREN + WORKER FORKEN ===
 async function sendAlert(contractAddress, totalUsd, breakdown, verified) {
+  // DEDUPE: skip als binnen 7 dagen al een alert is verstuurd voor dit adres
+  if (isRecentlyAlerted(contractAddress)) {
+    const ageHours = Math.round((Date.now() - alertedMap.get(contractAddress.toLowerCase())) / 3600000);
+    console.log(`[DEDUPE-SKIP] ${contractAddress} - al gealerted ${ageHours}u geleden`);
+    return;
+  }
+
   // Laatste check: skip bekende infra
   try {
     const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${BSCSCAN_KEY}`;
-    const infoRes = await axios.get(infoUrl, { timeout: 10000 });
+    const infoRes = await bscScanGet(infoUrl);
     const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
     const ALERT_SKIP = ['pancake','uniswap','sushi','thena','biswap','curve','algebra','nomiswap',
       'kernel','semimodular','simpleaccount','lightaccount','biconomy','gnosissafe','gnosisproxy','safeproxy',
@@ -1604,7 +1978,7 @@ async function sendAlert(contractAddress, totalUsd, breakdown, verified) {
   const verifiedIcon = verified ? '✅ Ja' : '❌ Nee';
   const alertIcon = verified ? '🚨' : '💰';
 
-  const message = `${alertIcon} *CONTRACT GEVONDEN MET $10K+*
+  const message = `${alertIcon} *CONTRACT GEVONDEN MET $${(MIN_BALANCE_USD/1000).toFixed(0)}K+*
 
 ━━━━━━━━━━━━━━━━━━━━
 📋 *Contract:*
@@ -1623,6 +1997,7 @@ ${balanceLines}📝 *Verified:* ${verifiedIcon}
   try {
     await safeSend(message);
     alertsSent++;
+    markAlerted(contractAddress); // Dedupe: niet nogmaals binnen 7 dagen
 
     recentAlerts.unshift({
       address: contractAddress,
@@ -1634,40 +2009,30 @@ ${balanceLines}📝 *Verified:* ${verifiedIcon}
 
     console.log(`[ALERT] Verzonden voor ${contractAddress} ($${totalUsd.toFixed(0)})`);
 
-    // Skip als al in analyse of te veel workers
+    // Skip als al in analyse of al in queue
     if (analyzingAddresses.has(contractAddress.toLowerCase())) return;
+    if (workerQueue.some(q => q.address.toLowerCase() === contractAddress.toLowerCase())) return;
+
+    const priority = calcPriority(totalUsd, Date.now());
+
     if (activeWorkers.size >= MAX_WORKERS) {
-      console.log(`[WORKER] Max workers bereikt (${MAX_WORKERS}), analyse uitgesteld voor ${contractAddress}`);
+      workerQueue.push({ address: contractAddress, totalUsd, breakdown, priority, detectedAt: Date.now() });
+      workerQueue.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+      console.log(`[QUEUE] ${contractAddress} in wachtrij (prio ${priority}, ${workerQueue.length} wachtend)`);
       return;
     }
 
-    // Fork analyse worker — scanner draait gewoon door!
-    analyzingAddresses.add(contractAddress.toLowerCase());
-    const worker = fork(path.join(__dirname, 'analyze-worker.js'));
-    activeWorkers.add(worker);
-    console.log(`[WORKER] Analyse worker gestart voor ${contractAddress} (${activeWorkers.size}/${MAX_WORKERS} actief)`);
+    // Pre-flight check vóór directe start
+    const check = await preFlightCheck(contractAddress, totalUsd);
+    if (!check.pass) {
+      console.log(`[WORKER] ❌ Pre-flight gefaald: ${check.reason} — skip analyse`);
+      return;
+    }
+    if (check.currentUsd && Math.abs(check.currentUsd - totalUsd) > 100) {
+      totalUsd = check.currentUsd;
+    }
 
-    worker.send({ address: contractAddress, totalUsd, breakdown });
-
-    worker.on('message', (msg) => {
-      if (msg.done) {
-        console.log(`[WORKER] Analyse klaar: ${msg.address}${msg.error ? ' (fout: ' + msg.error + ')' : ''}`);
-        activeWorkers.delete(worker);
-        analyzingAddresses.delete(msg.address.toLowerCase());
-      }
-    });
-
-    worker.on('error', (err) => {
-      console.error(`[WORKER] Worker error:`, err.message);
-      activeWorkers.delete(worker);
-      analyzingAddresses.delete(contractAddress.toLowerCase());
-    });
-
-    worker.on('exit', (code) => {
-      if (code !== 0) console.error(`[WORKER] Worker crashed met code ${code}`);
-      activeWorkers.delete(worker);
-      analyzingAddresses.delete(contractAddress.toLowerCase());
-    });
+    startWorker(contractAddress, totalUsd, breakdown);
 
   } catch (err) {
     console.error('[ALERT] Fout bij verzenden:', err.message);
@@ -1733,7 +2098,7 @@ async function sendContractList() {
   }
 
   list += `\n━━━━━━━━━━━━━━━━━━━━`;
-  list += `\n✅ = Verified | 💰 = $10k+ | 🚨 = Match`;
+  list += `\n✅ = Verified | 💰 = $${(MIN_BALANCE_USD/1000).toFixed(0)}k+ | 🚨 = Match`;
   list += `\nTotaal bekeken: ${contractsFound}`;
 
   try {
@@ -1817,61 +2182,68 @@ async function checkContract(contractAddress, source) {
       console.log(`[CHECK] ${contractAddress} - $${totalUsd.toFixed(0)} - checking verified... (${source})`);
       const verified = await isVerified(contractAddress);
       contractInfo.verified = verified;
-      if (verified) {
-        // Check contractnaam — skip bekende DEX/infra contracten
-        try {
-          const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${BSCSCAN_KEY}`;
-          const infoRes = await axios.get(infoUrl);
-          const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
-          const SKIP_NAMES = [
-            // DEX pools & routers & LP
-            'pancakepair', 'pancakev3pool', 'pancakev3', 'pancakestableswap', 'pancakefactory', 'pancakerouter',
-            'pancakeswap', 'pancake', 'nomiswapstable', 'nomiswap',
-            'uniswapv2pair', 'uniswapv3pool', 'uniswapv2factory', 'uniswapv2router', 'uniswap',
-            'algebrapool', 'algebrafactory',
-            'sushiswap', 'sushipool', 'sushirouter',
-            'thenapool', 'thenafusion', 'thenagauge',
-            'biswappair', 'biswapfactory', 'biswap',
-            'apeswap', 'babyswap', 'bakeryswap', 'mdex',
-            'swapflashloan', 'stableswap', 'curverpool', 'curvepool',
-            'liquiditypool', 'ammpool', 'tradingpool',
-            // Wallets & account abstraction (ERC-4337)
-            'kernel', 'semimodularaccount', 'semimodularaccountbytecode',
-            'simpleaccount', 'lightaccount', 'biconomyaccount',
-            'gnosissafe', 'gnosisproxy', 'gnosissafeproxy', 'safeproxy', 'safe',
-            'ownbitmultisig', 'ownbitmultisigproxy', 'paymentwallet', 'tokenwallet',
-            'nervemultisig',
-            // Proxies & infra
-            'transparentupgradeableproxy', 'transparentproxy',
-            'erc1967proxy', 'beaconproxy', 'stakingproxy',
-            'immutableadminupgradeabilityproxy', 'adminupgradeabilityproxy',
-            'masterchef', 'masterstaking', 'timelock', 'multicall', 'proxyadmin',
-            'forwarderv4', 'forwarder',
-            // Bridges & cross-chain
-            'originaltokenbridge', 'multiplibridger', 'layerzero', 'stargate',
-            'wormhole', 'celer', 'multichain', 'anyswap',
-            // Lending & bekende protocols
-            'venuspool', 'vtoken', 'vbep', 'comptroller',
-            'aavepool', 'aavetoken', 'lendingpool',
-            'alpacafinance', 'alpacavault',
-            // Overig infra
-            'payrollinstance', 'dpp', 'dodo', 'dodov2',
-            'treasury', 'arbitragetreasury',
-            'escrowsrc', 'rfqrouter', 'spoke',
-            'chainlinkfeed', 'chainlinkoracle', 'pricefeed',
-            'superstrategy', 'strategy', 'vault', 'strategymanager',
-          ];
-          // Exacte naam matches voor generieke smart wallet/infra namen
-          const SKIP_EXACT = ['account', 'depository', 'pool', 'root', 'asset', 'wallet', 'solver', 'pair', 'factory', 'router'];
-          if (SKIP_NAMES.some(s => cName.includes(s)) || SKIP_EXACT.includes(cName)) {
-            console.log(`[SKIP] ${contractAddress} - ${cName} (bekende infra)`);
-            SKIP_ADDRESSES.add(contractAddress.toLowerCase());
-            try { fs.appendFileSync(DYNAMIC_SKIP_FILE, contractAddress.toLowerCase() + '\n'); } catch (e) {}
-            return;
-          }
-        } catch (e) {}
+
+      // Check contractnaam — skip bekende DEX/infra contracten (ook bij unverified: probeer naam op te halen)
+      try {
+        const infoUrl = `https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${BSCSCAN_KEY}`;
+        const infoRes = await bscScanGet(infoUrl);
+        const cName = (infoRes.data.result?.[0]?.ContractName || '').toLowerCase();
+        const SKIP_NAMES = [
+          // DEX pools & routers & LP
+          'pancakepair', 'pancakev3pool', 'pancakev3', 'pancakestableswap', 'pancakefactory', 'pancakerouter',
+          'pancakeswap', 'pancake', 'nomiswapstable', 'nomiswap',
+          'uniswapv2pair', 'uniswapv3pool', 'uniswapv2factory', 'uniswapv2router', 'uniswap',
+          'algebrapool', 'algebrafactory',
+          'sushiswap', 'sushipool', 'sushirouter',
+          'thenapool', 'thenafusion', 'thenagauge',
+          'biswappair', 'biswapfactory', 'biswap',
+          'apeswap', 'babyswap', 'babypair', 'babyerc20', 'bakeryswap', 'mdex',
+          'swapflashloan', 'stableswap', 'curverpool', 'curvepool',
+          'liquiditypool', 'ammpool', 'tradingpool',
+          // Wallets & account abstraction (ERC-4337)
+          'kernel', 'semimodularaccount', 'semimodularaccountbytecode',
+          'simpleaccount', 'lightaccount', 'biconomyaccount',
+          'gnosissafe', 'gnosisproxy', 'gnosissafeproxy', 'safeproxy', 'safe',
+          'ownbitmultisig', 'ownbitmultisigproxy', 'paymentwallet', 'tokenwallet',
+          'nervemultisig',
+          // Proxies & infra
+          'transparentupgradeableproxy', 'transparentproxy',
+          'erc1967proxy', 'beaconproxy', 'stakingproxy',
+          'immutableadminupgradeabilityproxy', 'adminupgradeabilityproxy',
+          'masterchef', 'masterstaking', 'timelock', 'multicall', 'proxyadmin',
+          'forwarderv4', 'forwarder',
+          // Bridges & cross-chain
+          'originaltokenbridge', 'multiplibridger', 'layerzero', 'stargate',
+          'wormhole', 'celer', 'multichain', 'anyswap',
+          // Lending & bekende protocols
+          'venuspool', 'vtoken', 'vbep', 'comptroller',
+          'aavepool', 'aavetoken', 'lendingpool',
+          'alpacafinance', 'alpacavault',
+          // Overig infra
+          'payrollinstance', 'dpp', 'dodo', 'dodov2',
+          'treasury', 'arbitragetreasury',
+          'escrowsrc', 'rfqrouter', 'spoke',
+          'chainlinkfeed', 'chainlinkoracle', 'pricefeed',
+          'superstrategy', 'strategy', 'vault', 'strategymanager',
+        ];
+        const SKIP_EXACT = ['account', 'depository', 'pool', 'root', 'asset', 'wallet', 'solver', 'pair', 'factory', 'router'];
+        if (SKIP_NAMES.some(s => cName.includes(s)) || SKIP_EXACT.includes(cName)) {
+          console.log(`[SKIP] ${contractAddress} - ${cName} (bekende infra)`);
+          SKIP_ADDRESSES.add(contractAddress.toLowerCase());
+          try { fs.appendFileSync(DYNAMIC_SKIP_FILE, contractAddress.toLowerCase() + '\n'); } catch (e) {}
+          return;
+        }
+      } catch (e) {}
+
+      if (verified === true) {
         verifiedContracts++;
-        await sendAlert(contractAddress, totalUsd, breakdown, verified);
+        await sendAlert(contractAddress, totalUsd, breakdown, true);
+      } else if (verified === false) {
+        console.log(`[UNVERIFIED] ${contractAddress} - geen source op BscScan, skip`);
+      } else {
+        // null = rate-limited
+        console.log(`[RATE-LIMITED] ${contractAddress} - BscScan rate-limit uitgeput, queue voor retry`);
+        scheduleVerifyRetry(contractAddress, totalUsd, breakdown, source);
       }
     }
 
@@ -1881,6 +2253,25 @@ async function checkContract(contractAddress, source) {
     // Skip
   }
 }
+
+// === SKIP FACTORY DEPLOYERS ===
+// Contracten deployed door deze adressen worden direct overgeslagen (PancakePairs, Kernels, etc.)
+const SKIP_DEPLOYERS = new Set([
+  // PancakeSwap factories (deployen PancakePair / PancakeV3Pool)
+  '0xca143ce32fe78f1f7019d7d551a6402fc5350c73', // PancakeSwap Factory v2
+  '0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865', // PancakeSwap Factory v3
+  '0x6725f303b657a9451d8ba641348b6761a6cc7a17', // PancakeSwap Deployer
+  '0x41ff9aa7e16b8b1a8a8dc4f0efacd93d02d071c9', // PancakeSwap StableSwap Factory
+  // Kernel (ERC-4337 account abstraction wallets)
+  '0xd703aaE79538628d27099B8c4f621bE4CCd142d5'.toLowerCase(), // Kernel Factory v2
+  '0x5de4839a76cf55d0c90e2061ef4386d962E15ae3'.toLowerCase(), // Kernel Factory v2.1
+  '0x0082d877D3C26E09F76D71d76a2aE0E16a394b1c'.toLowerCase(), // Kernel Factory v3
+  '0xaac5D4240AF87249B3f71BC8E4A2cae074A3E419'.toLowerCase(), // Kernel Factory (alt)
+  // Biconomy Smart Account Factory
+  '0x000000a56Aaca3e9a4C479ea6b6CD0DbcB6634F5'.toLowerCase(),
+  // Safe (Gnosis) Proxy Factory
+  '0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2'.toLowerCase(),
+]);
 
 // === TRACK A: BLOCK SCANNEN (alleen nieuwe deploys) ===
 async function scanBlock(blockNumber) {
@@ -1893,6 +2284,8 @@ async function scanBlock(blockNumber) {
     const contractTxs = block.prefetchedTransactions.filter(tx => tx.to === null);
     for (const tx of contractTxs) {
       try {
+        // Skip contracten deployed door bekende factories (PancakePair, Kernel, etc.)
+        if (SKIP_DEPLOYERS.has(tx.from.toLowerCase())) continue;
         const receipt = await p.getTransactionReceipt(tx.hash);
         if (!receipt || !receipt.contractAddress) continue;
         await checkContract(receipt.contractAddress, 'deploy');
@@ -1918,6 +2311,7 @@ const TRANSFER_MIN_USD = MIN_BALANCE_USD; // zelfde drempel als balance check
 
 // Dedup voor transfer checks: voorkom dat we hetzelfde adres elke seconde checken
 const recentTransferChecks = new Map(); // address -> timestamp
+const transferHitLog = new Map(); // address -> timestamp (laatste TRANSFER-HIT log, dedup 30 min)
 // Cleanup elke 10 minuten
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
@@ -1961,10 +2355,14 @@ async function handleTransferLog(log) {
     console.log(`[TRANSFER] ${stablecoin.name} $${amount.toFixed(0)} naar contract ${to.slice(0, 10)}...`);
 
     // Als dit adres al door de volledige pipeline is geweest, doe alleen balance check
+    // Maar max 1x per 30 min loggen om spam te voorkomen
     if (checkedAddresses.has(toAddr)) {
+      const lastHit = transferHitLog.get(toAddr) || 0;
+      if (Date.now() - lastHit < 30 * 60 * 1000) return; // skip als <30 min geleden gelogd
       try {
         const { totalUsd, breakdown } = await getTotalBalance(to);
         if (totalUsd >= MIN_BALANCE_USD) {
+          transferHitLog.set(toAddr, Date.now());
           console.log(`[TRANSFER-HIT] ${to} heeft nu $${totalUsd.toFixed(0)} (via ${stablecoin.name} transfer)`);
         }
       } catch (e) {}
@@ -2036,7 +2434,8 @@ async function main() {
   await updateBnbPrice();
 
   setInterval(updateBnbPrice, 5 * 60 * 1000);
-  setInterval(sendLiveUpdate, STATUS_INTERVAL);
+  // Live update naar Telegram uitgeschakeld — gebruik /status als je het wilt zien
+  // setInterval(sendLiveUpdate, STATUS_INTERVAL);
   setInterval(sendHeartbeat, 60000);
   sendHeartbeat();
 

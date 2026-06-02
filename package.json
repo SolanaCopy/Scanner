@@ -7,9 +7,11 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "ethers": "^6.13.0",
-    "node-telegram-bot-api": "^0.66.0",
+    "@nomicfoundation/hardhat-ethers": "^3.1.3",
+    "axios": "^1.7.0",
     "dotenv": "^16.4.0",
-    "axios": "^1.7.0"
+    "ethers": "^6.13.0",
+    "hardhat": "^2.28.6",
+    "node-telegram-bot-api": "^0.66.0"
   }
 }

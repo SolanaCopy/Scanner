@@ -1,0 +1,243 @@
+[
+ {
+  "name": "TokenHolder",
+  "vuln": "0x8c7f34436C0037742AeCf047e06fD4B27Ad01117",
+  "lost": "20 WBNB",
+  "block": "63856735",
+  "postmortem": null,
+  "month": "2025-10",
+  "verified": true,
+  "cname": "BorrowerOperationsV6",
+  "srcLen": 85517
+ },
+ {
+  "name": "NGP",
+  "vuln": "0xd2f26200cd524db097cf4ab7cc2e5c38ab6ae5c9",
+  "lost": "2M USDT",
+  "block": "61515895",
+  "postmortem": "https://blog.solidityscan.com/ngp-token-hack-analysis-414b6ca16d96",
+  "month": "2025-09",
+  "verified": true,
+  "cname": "Token",
+  "srcLen": 57558
+ },
+ {
+  "name": "YuliAI",
+  "vuln": "0x8262325Bf1d8c3bE83EB99f5a74b8458Ebb96282",
+  "lost": "78k USD",
+  "block": "57432056",
+  "postmortem": null,
+  "month": "2025-08",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "PDZ",
+  "vuln": "0x664201579057f50D23820d20558f4b61bd80BDda",
+  "lost": "3.3 BNB",
+  "block": "57744491",
+  "postmortem": null,
+  "month": "2025-08",
+  "verified": true,
+  "cname": "TOKENbnb",
+  "srcLen": 43747
+ },
+ {
+  "name": "MulticallWithXera",
+  "vuln": "0x90be00229fe8000000009e007743a485d400c3b7",
+  "lost": "17k USD",
+  "block": "58269338",
+  "postmortem": "https://x.com/TenArmorAlert/status/1958354933247590450",
+  "month": "2025-08",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "Grizzifi",
+  "vuln": "0x21ab8943380b752306abf4d49c203b011a89266b",
+  "lost": "61k USD",
+  "block": "57478534",
+  "postmortem": null,
+  "month": "2025-08",
+  "verified": true,
+  "cname": "Grizzifi",
+  "srcLen": 30557
+ },
+ {
+  "name": "ABCCApp",
+  "vuln": "0x1bc016c00f8d603c41a582d5da745905b9d034e5",
+  "lost": "~ 10,062 BUSD",
+  "block": "58",
+  "postmortem": null,
+  "month": "2025-08",
+  "verified": true,
+  "cname": "ABCCApp",
+  "srcLen": 23822
+ },
+ {
+  "name": "WETC_Token",
+  "vuln": "0xaf68efb3c1e81aad5cdb3d4962c8815fb754c688",
+  "lost": "101k USD",
+  "block": "54333337",
+  "postmortem": "https://t.me/evmhacks/78?single",
+  "month": "2025-07",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "VDS",
+  "vuln": "0x6ce69d7146dbaae18c11c36d8d94428623b29d5a",
+  "lost": "13k USD",
+  "block": "54252254",
+  "postmortem": null,
+  "month": "2025-07",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "Stepp2p",
+  "vuln": "0x99855380e5f48db0a6babeae312b80885a816dce",
+  "lost": "43k USD",
+  "block": "54653987",
+  "postmortem": null,
+  "month": "2025-07",
+  "verified": true,
+  "cname": "Stepp2p",
+  "srcLen": 39238
+ },
+ {
+  "name": "RANTToken",
+  "vuln": "0xc321ac21a07b3d593b269acdace69c3762ca2dd0",
+  "lost": "~ 311.4 BNB",
+  "block": "52",
+  "postmortem": null,
+  "month": "2025-07",
+  "verified": true,
+  "cname": "RANTToken",
+  "srcLen": 72636
+ },
+ {
+  "name": "MulticallWithETH",
+  "vuln": "0x3da0f00d5c4e544924bc7282e18497c4a4c92046",
+  "lost": "~10 K usdt",
+  "block": "55371342",
+  "postmortem": null,
+  "month": "2025-07",
+  "verified": true,
+  "cname": "MulticallWithETH",
+  "srcLen": 2759
+ },
+ {
+  "name": "FPC",
+  "vuln": "0xb192d4a737430aa61cea4ce9bfb6432f7d42592f",
+  "lost": "4.7M USDT",
+  "block": "52624701",
+  "postmortem": null,
+  "month": "2025-07",
+  "verified": true,
+  "cname": "Token",
+  "srcLen": 44603
+ },
+ {
+  "name": "unverified_b5cb",
+  "vuln": "0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c",
+  "lost": "2M USD",
+  "block": "52052680",
+  "postmortem": "https://x.com/TenArmorAlert/status/1937761064713941187",
+  "month": "2025-06",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "Gangsterfinance",
+  "vuln": "0xe968d2e4adc89609773571301abec3399d163c3b",
+  "lost": "16.5k USD",
+  "block": "51782713",
+  "postmortem": null,
+  "month": "2025-06",
+  "verified": true,
+  "cname": "TokenVault",
+  "srcLen": 26288
+ },
+ {
+  "name": "BankrollNetwork",
+  "vuln": "0xAdEfb902CaB716B8043c5231ae9A50b8b4eE7c4e",
+  "lost": "24.5 WBNB",
+  "block": "51",
+  "postmortem": "https://x.com/Phalcon_xyz/status/1943518566831296566",
+  "month": "2025-06",
+  "verified": true,
+  "cname": "BankrollNetworkStack",
+  "srcLen": 34498
+ },
+ {
+  "name": "KRCToken_pair",
+  "vuln": "0xdbead75d3610209a093af1d46d5296bbeffd53f5",
+  "lost": "7k USD",
+  "block": "49875424",
+  "postmortem": "https://x.com/OpenZeppelin/status/1953111764536561867",
+  "month": "2025-05",
+  "verified": true,
+  "cname": "PancakePair",
+  "srcLen": 20758
+ },
+ {
+  "name": "YBToken",
+  "vuln": "0x113F16A3341D32c4a38Ca207Ec6ab109cF63e434",
+  "lost": "15261.68240413121964707 BUSD",
+  "block": "48415276",
+  "postmortem": null,
+  "month": "2025-04",
+  "verified": false,
+  "srcLen": 0
+ },
+ {
+  "name": "Lifeprotocol",
+  "vuln": "0x42e2773508e2ae8ff9434bea599812e28449e2cd",
+  "lost": "15114 BUSD",
+  "block": "48703546",
+  "postmortem": "//",
+  "month": "2025-04",
+  "verified": true,
+  "cname": "LifeProtocolContract",
+  "srcLen": 53085
+ },
+ {
+  "name": "BTNFT",
+  "vuln": "0x0FC91B6Fea2E7A827a8C99C91101ed36c638521B",
+  "lost": "19025.9193312786235214 BUSD",
+  "block": "48472356",
+  "postmortem": null,
+  "month": "2025-04",
+  "verified": true,
+  "cname": "BTNFT",
+  "srcLen": 142470
+ },
+ {
+  "name": "AIRWA",
+  "vuln": "0x3af7da38c9f68df9549ce1980eef4ac6b635223a",
+  "lost": "~ 56.73 BNB",
+  "block": "48",
+  "postmortem": null,
+  "month": "2025-04",
+  "verified": false,
+  "cname": "",
+  "srcLen": 0
+ },
+ {
+  "name": "YziAIToken",
+  "vuln": "0x7fdff64bf87bad52e6430bda30239bd182389ee3",
+  "lost": "~ 376 BNB",
+  "block": "47",
+  "postmortem": null,
+  "month": "2025-03",
+  "verified": true,
+  "cname": "YziLabs",
+  "srcLen": 160559
+ }
+]
