@@ -7,7 +7,7 @@ const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { pickDrainCandidates, pickDepositCandidates, buildDrainScript, parseDrains } = require('./drain-detector.js');
+const { pickDrainCandidates, pickDepositCandidates, pickApprovalCandidates, buildDrainScript, buildApprovalDrainScript, parseDrains } = require('./drain-detector.js');
 // Tokens om drain-stromen te volgen (BSC)
 const DRAIN_TOKENS = {
   USDT: '0x55d398326f99059fF775485246999027B3197955',
@@ -1657,11 +1657,19 @@ process.on('message', async (msg) => {
         if (abiRes.data.status === '1' && abiRes.data.result.startsWith('[')) {
           const abi = JSON.parse(abiRes.data.result);
           const cands = pickDrainCandidates(abi, slitherResult.success ? slitherResult.findings : []);
+          const apprCands = pickApprovalCandidates(abi, slitherResult.success ? slitherResult.findings : []);
+          let drains = [];
           if (cands.length > 0) {
             console.log(`[DRAIN] ${cands.length} kandidaat-functies testen op fork: ${address}`);
             const out = await runOnAnvilFork(address, buildDrainScript(cands, pickDepositCandidates(abi), DRAIN_TOKENS));
-            const drains = parseDrains(out);
-            drainResult = { tested: true, candidates: cands.length, drains };
+            drains = parseDrains(out);
+          }
+          if (apprCands.length > 0) {
+            console.log(`[DRAIN] ${apprCands.length} approval-kandidaten testen: ${address}`);
+            try { const aout = await runOnAnvilFork(address, buildApprovalDrainScript(apprCands)); drains.push(...parseDrains(aout)); } catch (e) { console.error('[DRAIN] approval fout: ' + (e.message || '').slice(0, 80)); }
+          }
+          {
+            drainResult = { tested: cands.length > 0 || apprCands.length > 0, candidates: cands.length + apprCands.length, drains };
             if (drains.length > 0) {
               console.log(`[DRAIN] 🔴 ${drains.length} DRAIN(S) op ${address}: ${drains.map(d => d.fn + '/' + d.token).join(', ')}`);
               let dmsg = `🔴 *PERMISSIONLESS DRAIN BEWEZEN*\n━━━━━━━━━━━━━━━━━━━━\n📝 *${contractName || securityResult.contractName || 'Onbekend'}*\n\`${address}\`\n💰 $${Math.round(totalUsd).toLocaleString()}\n\n_Een niet-owner kan fondsen wegtrekken (bewezen op Anvil-fork):_\n`;

